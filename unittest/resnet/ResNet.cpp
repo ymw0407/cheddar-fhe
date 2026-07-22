@@ -328,7 +328,8 @@ TEST_P(Testbed32, ResNet20) {
     mkdir(dataset_dir.c_str(), 0777);
     DownloadCifar10Data();
   }
-  int num_test_images = 1;
+  int num_test_images = 1;  // override with IMAGES=n (sequential from img 0)
+  if (const char *env = getenv("IMAGES")) num_test_images = atoi(env);
   CIFAR cifar("./" + dataset_dir);
   cifar.read();
   cifar.transform({0, 0, 0}, {255, 255, 255});

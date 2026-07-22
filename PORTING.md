@@ -64,7 +64,11 @@ narrowing 단계에서 출력 복제본 k(+k·u_out 위치)는 회전 (r − k·
       HoistHandler baby 경로 bs≠0 소실(수동 BSGS 로 우회) → narrowing 복제 보정
 - [x] ops_test 기하 8종 통과 (delta stamp·경계·conv0 실가중치·CIFAR 크기)
 - [x] round6: conv0 max 평문 완전일치(0.138545), L1 3블록 궤적 일치, L2 생존
-- [ ] round7: 수동 BSGS 로 L3 관문 통과 → 로짓 vs 평문 (pred=3) = P1 완료
+- [x] round7: 수동 BSGS 로 L3 관문 통과, E2E 3.40s — 남은 문제 = FC 로짓 폭주
+- [x] round8: FC 도 ManualLinear(수동 BSGS 대각법) 로 교체 → **로짓 정합,
+      pred=3 정답, Accuracy 1 (3.41s) = P1 정확성 완료** (2026-07-22)
+      로짓 편차 ±0.3~0.9 는 sign 합성(전이 0.05) 근사 노이즈 — argmax 마진 충분
+- [ ] IMAGES=n 다중 이미지 FHE 정확도 (목표: 평문 fused 모델과 동률 근처)
 - [ ] baseline 시간·정확도 (anchor: 공표 1.32s/A100, acc ~91.3%)
 - [ ] MemResNet.cpp + export (FHE-research 쪽 P2·P3 과 합류)
 

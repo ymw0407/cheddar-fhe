@@ -414,6 +414,55 @@ TEST_P(Testbed32, DeltaBorderGeometry) {
   EXPECT_EQ(bad, 0);
 }
 
+TEST_P(Testbed32, BootRangeProbe) {
+  // Maps the safe input envelope of bootstrapping: bands of constant
+  // magnitude 0.25 .. 2.0 (+ mirrored negatives) are booted from level 1 and
+  // the per-band error is printed. Decides how much sign-domain headroom the
+  // relu path may claim (activations reach 1.47x relu_range in CIFAR test).
+  MultiLevelCiphertext<word>::StaticInit(context_->param_, context_->encoder_);
+  auto boot_context = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot_context, nullptr);
+
+  boot_context->PrepareEvalMod();
+  boot_context->PrepareEvalSpecialFFT(kNumSlots,
+                                      BootVariant::kImaginaryRemoving);
+  EvkRequest req;
+  boot_context->AddRequiredRotations(req, kNumSlots);
+  interface_->PrepareRotationKey(req);
+
+  const std::vector<double> mags = {0.25, 0.5,  0.75, 0.9, 1.0, 1.05,
+                                    1.1,  1.25, 1.5,  2.0};
+  std::vector<Complex> msg(kNumSlots, Complex(0, 0));
+  const int band = kNumSlots / static_cast<int>(mags.size());
+  for (size_t m = 0; m < mags.size(); m++) {
+    for (int j = 0; j < band; j++) {
+      int s = static_cast<int>(m) * band + j;
+      msg[s] = Complex((j % 2 == 0) ? mags[m] : -mags[m], 0);
+    }
+  }
+  Ct ct;
+  EncodeAndEncrypt(ct, msg, 1);
+  boot_context->Boot(ct, ct, interface_->GetEvkMap(), false);
+
+  std::vector<Complex> out;
+  DecryptAndDecode(out, ct);
+  for (size_t m = 0; m < mags.size(); m++) {
+    double err = 0;
+    for (int j = 0; j < band; j++) {
+      int s = static_cast<int>(m) * band + j;
+      err = std::max(err, std::abs(out[s].real() - msg[s].real()));
+    }
+    std::cout << "boot band |v|=" << mags[m] << " max err=" << err
+              << std::endl;
+  }
+  // only the well-inside-range band is asserted; the rest is diagnostic
+  double err_low = 0;
+  for (int j = 0; j < band; j++) {
+    err_low = std::max(err_low, std::abs(out[j].real() - msg[j].real()));
+  }
+  EXPECT_LT(err_low, 1e-2);
+}
+
 // History note: the library's hoisted baby-step path (HoistHandler with
 // inner-key groups) dropped every bs != 0 contribution for our conv maps —
 // a delta-input probe kept only the center tap, while the auto-swapped

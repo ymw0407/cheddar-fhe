@@ -102,6 +102,7 @@ def main():
         sys.argv.remove("--debug")
     num = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     raw = open(CIFAR_BIN, "rb").read()
+    correct = 0
     for i in range(num):
         rec = raw[i * 3073:(i + 1) * 3073]
         label = rec[0]
@@ -109,9 +110,13 @@ def main():
         img = img.reshape(3, 32, 32) / 255.0
         img = (img - MEAN) / STD
         logits = forward(img)
+        pred = int(np.argmax(logits))
+        correct += int(pred == label)
         print(f"img {i} true label {label} logits:",
               " ".join(f"{v:.5f}" for v in logits),
-              f"-> pred {int(np.argmax(logits))}")
+              f"-> pred {pred}")
+    if num > 1:
+        print(f"plain accuracy ({num} images): {correct / num:.4f}")
 
 
 if __name__ == "__main__":

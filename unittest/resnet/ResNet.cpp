@@ -365,6 +365,7 @@ TEST_P(Testbed32, ResNet20) {
     // NOTE: phase-wise key generation currently sits inside the timed
     // region — fine for the correctness round, must be hoisted out (or
     // accounted separately) before any timing comparison.
+    dbg("input", main_ct);
     std::cout << "-- Conv 0 --" << std::endl;
     load_group_keys(0);
     conv0.Evaluate(main_ct, main_ct, interface_->GetEvkMap());

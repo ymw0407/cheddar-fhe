@@ -7,6 +7,7 @@
 
 #include "../Testbed.h"
 #include "ExampleOps.h"
+#include "SignCoeffs.h"
 #include "cnpy.h"
 
 using word = uint32_t;
@@ -124,6 +125,132 @@ TEST_P(Testbed32, Conv0RealWeights) {
   conv.Evaluate(ct, ct, interface_->GetEvkMap());
 
   // CPU reference
+  TensorLayout out_lay{32, 1, 16};
+  std::vector<Complex> expected(kNumSlots, Complex(0, 0));
+  int u_out = out_lay.UsedSlots();
+  for (int co = 0; co < 16; co++) {
+    for (int y = 0; y < 32; y++) {
+      for (int x = 0; x < 32; x++) {
+        double acc = 0.1 * b[co];
+        for (int ci = 0; ci < 3; ci++) {
+          for (int di = -1; di <= 1; di++) {
+            for (int dj = -1; dj <= 1; dj++) {
+              int yy = y + di, xx = x + dj;
+              if (yy < 0 || yy >= 32 || xx < 0 || xx >= 32) continue;
+              double in_v = msg[in.Slot(ci, yy, xx)].real();
+              double wv =
+                  w[((static_cast<size_t>(co) * 3 + ci) * 3 + (di + 1)) * 3 +
+                    (dj + 1)];
+              acc += 0.1 * wv * in_v;
+            }
+          }
+        }
+        int s = out_lay.Slot(co, y, x);
+        for (int rep = s; rep < kNumSlots; rep += u_out) {
+          expected[rep] = Complex(acc, 0);
+        }
+      }
+    }
+  }
+  std::vector<Complex> out;
+  DecryptAndDecode(out, ct);
+  CompareMessages(expected, out, true, 1e-2);
+}
+
+TEST_P(Testbed32, Conv0CifarMagnitude) {
+  // Same conv0 but with CIFAR-scale inputs (|x| up to ~2.3) --> tests
+  // whether the explosion is input-magnitude dependent (encoding overflow).
+  MultiLevelCiphertext<word>::StaticInit(context_->param_, context_->encoder_);
+  auto boot_context = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot_context, nullptr);
+
+  TensorLayout in{32, 1, 4};
+  cnpy::NpyArray w_npy = cnpy::npy_load(
+      std::string(PROJECT_ROOT) + "/resnet20_fused/conv1_reparam.weight");
+  cnpy::NpyArray b_npy = cnpy::npy_load(
+      std::string(PROJECT_ROOT) + "/resnet20_fused/conv1_reparam.bias");
+  const float *w = w_npy.data<float>();
+  const float *b = b_npy.data<float>();
+
+  ConvBN<word> conv(boot_context, in, 16, 3, 1, w, 3, b, 0.1, 0.1, kLevel);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<Complex> msg;
+  FillRamp(msg, in);
+  for (auto &v : msg) v *= 300.0;  // scale ramp into CIFAR range
+  Ct ct;
+  EncodeAndEncrypt(ct, msg, kLevel);
+  conv.Evaluate(ct, ct, interface_->GetEvkMap());
+
+  TensorLayout out_lay{32, 1, 16};
+  std::vector<Complex> expected(kNumSlots, Complex(0, 0));
+  int u_out = out_lay.UsedSlots();
+  for (int co = 0; co < 16; co++) {
+    for (int y = 0; y < 32; y++) {
+      for (int x = 0; x < 32; x++) {
+        double acc = 0.1 * b[co];
+        for (int ci = 0; ci < 3; ci++) {
+          for (int di = -1; di <= 1; di++) {
+            for (int dj = -1; dj <= 1; dj++) {
+              int yy = y + di, xx = x + dj;
+              if (yy < 0 || yy >= 32 || xx < 0 || xx >= 32) continue;
+              double in_v = msg[in.Slot(ci, yy, xx)].real();
+              double wv =
+                  w[((static_cast<size_t>(co) * 3 + ci) * 3 + (di + 1)) * 3 +
+                    (dj + 1)];
+              acc += 0.1 * wv * in_v;
+            }
+          }
+        }
+        int s = out_lay.Slot(co, y, x);
+        for (int rep = s; rep < kNumSlots; rep += u_out) {
+          expected[rep] = Complex(acc, 0);
+        }
+      }
+    }
+  }
+  std::vector<Complex> out;
+  DecryptAndDecode(out, ct);
+  CompareMessages(expected, out, true, 1e-2);
+}
+
+TEST_P(Testbed32, Conv0FullEnvironment) {
+  // conv0 with the FULL ResNet environment set up first: boot prepared,
+  // EvalReLU (3x EvalPoly compiled), extra keys --> tests environment
+  // side effects on the conv path.
+  MultiLevelCiphertext<word>::StaticInit(context_->param_, context_->encoder_);
+  auto boot_context = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot_context, nullptr);
+
+  boot_context->PrepareEvalMod();
+  boot_context->PrepareEvalSpecialFFT(kNumSlots,
+                                      BootVariant::kImaginaryRemoving);
+  int end_level = boot_context->boot_param_.GetEndLevel();
+  EvalReLU<word> relu(boot_context, kLevel - 1, end_level,
+                      kSignStages);
+
+  TensorLayout in{32, 1, 4};
+  cnpy::NpyArray w_npy = cnpy::npy_load(
+      std::string(PROJECT_ROOT) + "/resnet20_fused/conv1_reparam.weight");
+  cnpy::NpyArray b_npy = cnpy::npy_load(
+      std::string(PROJECT_ROOT) + "/resnet20_fused/conv1_reparam.bias");
+  const float *w = w_npy.data<float>();
+  const float *b = b_npy.data<float>();
+
+  ConvBN<word> conv(boot_context, in, 16, 3, 1, w, 3, b, 0.1, 0.1, kLevel);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  boot_context->AddRequiredRotations(req, kNumSlots);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<Complex> msg;
+  FillRamp(msg, in);
+  Ct ct;
+  EncodeAndEncrypt(ct, msg, kLevel);
+  conv.Evaluate(ct, ct, interface_->GetEvkMap());
+
   TensorLayout out_lay{32, 1, 16};
   std::vector<Complex> expected(kNumSlots, Complex(0, 0));
   int u_out = out_lay.UsedSlots();

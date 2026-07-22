@@ -28,6 +28,39 @@ if (ENABLE_EXTENSION)
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
+# ---- ResNet-20 workload (ported from cheddar-ae; see /PORTING.md) ----------
+if (ENABLE_EXTENSION)
+  FetchContent_Declare(
+    cnpy
+    GIT_REPOSITORY https://github.com/rogersce/cnpy
+    GIT_TAG        master
+  )
+  FetchContent_Declare(
+    Eigen
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG 3.3.9
+  )
+  FetchContent_MakeAvailable(Eigen)
+  FetchContent_MakeAvailable(cnpy)
+
+  add_executable(resnet resnet/ResNet.cpp)
+  target_compile_definitions(resnet PRIVATE PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
+  target_include_directories(resnet PRIVATE ${cnpy_SOURCE_DIR}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/resnet)
+  target_link_libraries(resnet
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json
+                                cnpy eigen)
+
+  configure_file(${CMAKE_SOURCE_DIR}/parameters/resnetparam_30.json
+                 ${CMAKE_CURRENT_BINARY_DIR}/resnetparam_30.json COPYONLY)
+  configure_file(${CMAKE_SOURCE_DIR}/parameters/resnetparam_35.json
+                 ${CMAKE_CURRENT_BINARY_DIR}/resnetparam_35.json COPYONLY)
+  configure_file(${CMAKE_SOURCE_DIR}/parameters/resnetparam_40.json
+                 ${CMAKE_CURRENT_BINARY_DIR}/resnetparam_40.json COPYONLY)
+  configure_file(${CMAKE_SOURCE_DIR}/parameters/resnetparam_48.json
+                 ${CMAKE_CURRENT_BINARY_DIR}/resnetparam_48.json COPYONLY)
+endif()
+
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json
                ${CMAKE_CURRENT_BINARY_DIR}/bootparam_30.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_35.json

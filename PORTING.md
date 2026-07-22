@@ -68,7 +68,10 @@ narrowing 단계에서 출력 복제본 k(+k·u_out 위치)는 회전 (r − k·
 - [x] round8: FC 도 ManualLinear(수동 BSGS 대각법) 로 교체 → **로짓 정합,
       pred=3 정답, Accuracy 1 (3.41s) = P1 정확성 완료** (2026-07-22)
       로짓 편차 ±0.3~0.9 는 sign 합성(전이 0.05) 근사 노이즈 — argmax 마진 충분
-- [ ] IMAGES=n 다중 이미지 FHE 정확도 (목표: 평문 fused 모델과 동률 근처)
+- [x] sign 도메인 절벽(|x|>1 폭발) → 1단 x/2 폴드 + eps 0.025 재생성 (ec90097):
+      절벽 원시 20.5로, 전이대 0.5 유지. BootRangeProbe = 부트는 |v|≤2 오차 0.0034 균일.
+- [x] **50장 FHE 0.96 = 평문 0.94 동률(미스 ⊂ 평문 미스, 근사 기인 추가 미스 0) — P1 종결**
+- [ ] 타이밍 앵커: 키 생성을 측정 구간 밖으로 뺀 뒤 per-image 시간 확정
 - [ ] baseline 시간·정확도 (anchor: 공표 1.32s/A100, acc ~91.3%)
 - [ ] MemResNet.cpp + export (FHE-research 쪽 P2·P3 과 합류)
 

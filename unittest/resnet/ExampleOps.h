@@ -297,9 +297,9 @@ class EvalReLU {
     context_->encoder_.EncodeConstant(half, final_level_,
                                       context_->param_.GetScale(final_level_),
                                       0.5, 0);
-    Ct q;
-    context_->Mult(q, s, half);
-    context_->Rescale(q, q);
+    Ct q_raw, q;
+    context_->Mult(q_raw, s, half);
+    context_->Rescale(q, q_raw);
     Constant<word> half_add;
     context_->encoder_.EncodeConstant(
         half_add, context_->param_.NPToLevel(q.GetNP()),

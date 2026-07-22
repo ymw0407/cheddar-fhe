@@ -85,6 +85,13 @@ class UserInterface {
    */
   void PrepareRotationKey(const EvkRequest &evk_request);
 
+  /**
+   * @brief TEST-ONLY: erase a rotation key to free GPU memory. Used by
+   * workloads for phase-wise rotation-key residency (see unittest/resnet).
+   * Basic keys (multiplication/conjugation/...) are unaffected.
+   */
+  void EraseRotationKey(int rot_idx) { evk_map_.erase(rot_idx); }
+
  private:
   static inline constexpr double kErrorStandardDeviation = 3.2;
   static inline constexpr int kernel_block_dim_ = 256;

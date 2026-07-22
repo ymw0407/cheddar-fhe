@@ -228,18 +228,36 @@ TEST_P(Testbed32, ResNet20) {
   ResNetBlock block3_3(boot_context, l3, false, relu, path_list[9]);
 
   // ---- rotation key requests ---------------------------------------------
+  // Phase-wise key residency: conv keys of one layer group are generated
+  // right before the group and erased after it (~20 GB peak saving). Only
+  // `rotations` (boot + pool + FC) stays resident for the whole run.
   EvkRequest rotations;
-  conv0.AddRequiredRotations(rotations);
-  block1_1.AddRequiredRotations(rotations);
-  block1_2.AddRequiredRotations(rotations);
-  block1_3.AddRequiredRotations(rotations);
-  block2_1.AddRequiredRotations(rotations);
-  block2_2.AddRequiredRotations(rotations);
-  block2_3.AddRequiredRotations(rotations);
-  block3_1.AddRequiredRotations(rotations);
-  block3_2.AddRequiredRotations(rotations);
-  block3_3.AddRequiredRotations(rotations);
+  EvkRequest group_req[3];
+  conv0.AddRequiredRotations(group_req[0]);
+  block1_1.AddRequiredRotations(group_req[0]);
+  block1_2.AddRequiredRotations(group_req[0]);
+  block1_3.AddRequiredRotations(group_req[0]);
+  block2_1.AddRequiredRotations(group_req[1]);
+  block2_2.AddRequiredRotations(group_req[1]);
+  block2_3.AddRequiredRotations(group_req[1]);
+  block3_1.AddRequiredRotations(group_req[2]);
+  block3_2.AddRequiredRotations(group_req[2]);
+  block3_3.AddRequiredRotations(group_req[2]);
   boot_context->AddRequiredRotations(rotations, kNumSlots);
+
+  auto load_group_keys = [&](int g) {
+    interface_->PrepareRotationKey(group_req[g]);
+  };
+  auto drop_group_keys = [&](int g) {
+    for (const auto &[rot, level] : group_req[g]) {
+      if (rotations.find(rot) != rotations.end()) continue;  // shared: keep
+      bool used_later = false;
+      for (int h = g + 1; h < 3 && !used_later; h++) {
+        used_later = group_req[h].find(rot) != group_req[h].end();
+      }
+      if (!used_later) interface_->EraseRotationKey(rot);
+    }
+  };
 
   // ---- avg-pool + FC tail (follows the AE public code) --------------------
   constexpr int pool_input_width = 8;
@@ -327,21 +345,30 @@ TEST_P(Testbed32, ResNet20) {
     }
     __ProfileStart("ResNet20", warm_up,
                    EncodeAndEncrypt(main_ct, input_vecs, kConvLevel));
+    // NOTE: phase-wise key generation currently sits inside the timed
+    // region — fine for the correctness round, must be hoisted out (or
+    // accounted separately) before any timing comparison.
     std::cout << "-- Conv 0 --" << std::endl;
+    load_group_keys(0);
     conv0.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     relu->Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     std::cout << "-- Layer 1 --" << std::endl;
     block1_1.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     block1_2.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     block1_3.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    drop_group_keys(0);
     std::cout << "-- Layer 2 --" << std::endl;
+    load_group_keys(1);
     block2_1.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     block2_2.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     block2_3.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    drop_group_keys(1);
     std::cout << "-- Layer 3 --" << std::endl;
+    load_group_keys(2);
     block3_1.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     block3_2.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     block3_3.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    drop_group_keys(2);
 
     std::cout << "-- AvgPool --" << std::endl;
     AdjustLevel(boot_context, main_ct, kPoolLevel, interface_->GetEvkMap());

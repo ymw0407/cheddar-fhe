@@ -407,7 +407,7 @@ TEST_P(Testbed32, ResNet20) {
 
     DecryptAndDecode(output_vec, main_ct);
     std::cout << "logits[img " << i << "] (true label "
-              << test_labels(0, i) << "): ";
+              << test_labels(i) << "): ";
     for (int j = 0; j < 10; j++) {
       output(j, i) = output_vec[j].real();
       std::cout << output_vec[j].real() << " ";

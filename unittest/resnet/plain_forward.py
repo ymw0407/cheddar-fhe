@@ -60,9 +60,12 @@ def block(x, prefix, narrowing):
 
 
 DEBUG = False
+MAXACT = 0.0  # per-image running max |activation| (unnormalized)
 
 
 def dbg(name, x):
+    global MAXACT
+    MAXACT = max(MAXACT, float(np.abs(x).max()))
     # FHE ciphertexts carry x/10 (relu_range normalization); print in that unit
     if DEBUG:
         n = x / 10.0
@@ -100,23 +103,31 @@ def main():
     if "--debug" in sys.argv:
         DEBUG = True
         sys.argv.remove("--debug")
+    global MAXACT
     num = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     raw = open(CIFAR_BIN, "rb").read()
     correct = 0
+    misses = []
     for i in range(num):
         rec = raw[i * 3073:(i + 1) * 3073]
         label = rec[0]
         img = np.frombuffer(rec[1:], dtype=np.uint8).astype(np.float64)
         img = img.reshape(3, 32, 32) / 255.0
         img = (img - MEAN) / STD
+        MAXACT = 0.0
         logits = forward(img)
         pred = int(np.argmax(logits))
         correct += int(pred == label)
-        print(f"img {i} true label {label} logits:",
+        if pred != label:
+            misses.append(i)
+        # maxact vs relu_range(10): the FHE sign approx lives on |x|/10 <= 1,
+        # so maxact > 10 means that image breaches the approximation domain.
+        print(f"img {i} true label {label} maxact {MAXACT:.3f} logits:",
               " ".join(f"{v:.5f}" for v in logits),
               f"-> pred {pred}")
     if num > 1:
-        print(f"plain accuracy ({num} images): {correct / num:.4f}")
+        print(f"plain accuracy ({num} images): {correct / num:.4f}"
+              f"  misses: {misses}")
 
 
 if __name__ == "__main__":

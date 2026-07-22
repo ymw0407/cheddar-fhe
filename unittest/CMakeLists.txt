@@ -44,6 +44,13 @@ if (ENABLE_EXTENSION)
   FetchContent_MakeAvailable(cnpy)
 
   add_executable(resnet resnet/ResNet.cpp)
+  add_executable(ops_test resnet/OpsTest.cpp)
+  target_compile_definitions(ops_test PRIVATE PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
+  target_include_directories(ops_test PRIVATE ${cnpy_SOURCE_DIR}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/resnet)
+  target_link_libraries(ops_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json
+                                cnpy)
   target_compile_definitions(resnet PRIVATE PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
   target_include_directories(resnet PRIVATE ${cnpy_SOURCE_DIR}
                              ${CMAKE_CURRENT_SOURCE_DIR}/resnet)

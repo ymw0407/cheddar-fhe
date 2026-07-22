@@ -9,6 +9,7 @@
 // num_slots = kNumSlots (16384); content is periodic with the stage's
 // UsedSlots() and every mask is replicated accordingly.
 
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -39,26 +40,20 @@ struct TensorLayout {
   }
 };
 
-// Builds the hoist map of a KxK convolution (stride 1 or 2). For stride 2 the
-// output layout must be (width/2, pack*2, C_out); the rotation for a fixed
-// (c_in, c_out, tap) is (y,x)-independent in both cases (PORTING.md §2).
-// weights: float[C_out][C_in_w][K][K] (C_in_w = real weight input channels,
-// may be smaller than layout channels, e.g. conv0 has 3 real of 4 padded).
-// Every weight is multiplied by w_scale (e.g. 1/relu_range folding).
-// BSGS giant-step stride: rotations decompose as (frame shift)*1024 +
-// (small spatial delta), so grouping by multiples of 1024 shares giant-step
-// keys across all convs and keeps baby-step keys to the few spatial deltas.
-constexpr int kGsStride = 1024;
-
-inline PlainHoistMap BuildConvHoistMap(const TensorLayout &in,
-                                       const TensorLayout &out, int ksize,
-                                       int stride, const float *weights,
-                                       int c_in_w, double w_scale,
-                                       bool use_bsgs = true) {
+// Builds the per-rotation masks of a KxK convolution (stride 1 or 2). For
+// stride 2 the output layout must be (width/2, pack*2, C_out); the rotation
+// for a fixed (c_in, c_out, tap) is (y,x)-independent in both cases
+// (PORTING.md §2). weights: float[C_out][C_in_w][K][K] (C_in_w = real weight
+// input channels, may be smaller than layout channels, e.g. conv0 has 3 real
+// of 4 padded). Every weight is multiplied by w_scale (e.g. 1/relu_range
+// folding). Returns total rotation -> mask; all-zero masks are dropped.
+inline std::map<int, Message> BuildConvRotationMasks(
+    const TensorLayout &in, const TensorLayout &out, int ksize, int stride,
+    const float *weights, int c_in_w, double w_scale) {
   const int pad = ksize / 2;
   const int u_in = in.UsedSlots();
   const int u_out = out.UsedSlots();
-  std::map<int, Message> group;  // total rotation -> mask (BSGS split below)
+  std::map<int, Message> group;  // total rotation -> mask
 
   for (int co = 0; co < out.channels; co++) {
     for (int ci = 0; ci < c_in_w; ci++) {
@@ -103,32 +98,17 @@ inline PlainHoistMap BuildConvHoistMap(const TensorLayout &in,
       }
     }
   }
-  // BSGS split: rot = gs + bs with gs a multiple of kGsStride; the inner
-  // mask is pre-rotated by gs (LinearTransform convention:
-  // stored[(i + gs) % num_slots] = mask[i]). All-zero masks are dropped.
-  PlainHoistMap hoist_map;
-  for (const auto &[rot, msg] : group) {
+  for (auto it = group.begin(); it != group.end();) {
     bool all_zero = true;
-    for (const auto &v : msg) {
+    for (const auto &v : it->second) {
       if (v != Complex(0, 0)) {
         all_zero = false;
         break;
       }
     }
-    if (all_zero) continue;
-    int bs = use_bsgs ? rot % kGsStride : rot;
-    int gs = rot - bs;
-    if (hoist_map.find(gs) == hoist_map.end()) {
-      hoist_map.try_emplace(gs, std::map<int, Message>());
-    }
-    auto &pre_rotated =
-        hoist_map[gs].try_emplace(bs, Message(kNumSlots, Complex(0, 0)))
-            .first->second;
-    for (int i = 0; i < kNumSlots; i++) {
-      pre_rotated[(i + gs) % kNumSlots] = msg[i];
-    }
+    it = all_zero ? group.erase(it) : std::next(it);
   }
-  return hoist_map;
+  return group;
 }
 
 // Per-channel bias replicated over the spatial grid (and slot periodicity).
@@ -152,6 +132,20 @@ inline std::vector<Complex> BuildBiasMessage(const TensorLayout &out,
 }
 
 // Generic packed convolution + folded BN bias. Consumes exactly 1 level.
+//
+// Evaluation is manual (non-hoisted) BSGS over the total rotations:
+//   rot = gs + bs,  bs = rot % kBabyStride,  gs = rot - bs.
+// The input is rotated once per distinct baby step; per giant step the
+// masked baby terms are accumulated (masks pre-rotated by gs, LinearTransform
+// convention stored[(i+gs) % num_slots] = mask[i]) and the accumulator is
+// rotated by gs into the result. This needs |baby| + |giant| rotation keys
+// (~50) instead of one per distinct rotation (~500 for the layer-3 convs),
+// which is what keeps the rotation-key working set inside GPU memory.
+// The library's hoisted baby-step path is NOT used for convs: it drops
+// bs != 0 contributions for our maps (empirically; the LinearTransform-built
+// maps of FC/boot are unaffected), while plain HRot/HRotAdd are exact.
+constexpr int kBabyStride = 32;
+
 template <typename word>
 class ConvBN {
  public:
@@ -161,20 +155,34 @@ class ConvBN {
   std::shared_ptr<BootContext<word>> context_;
   TensorLayout in_, out_;
   int eval_level_;  // ciphertext level right before this conv
-  std::unique_ptr<HoistHandler<word>> hoist_;
+  std::map<int, std::map<int, Pt>> pt_;  // gs -> bs -> pre-rotated mask
+  std::vector<int> baby_set_;            // distinct bs != 0
   Pt bias_;
 
   ConvBN(std::shared_ptr<BootContext<word>> context, const TensorLayout &in,
          int out_channels, int ksize, int stride, const float *weights,
          int c_in_w, const float *bias, double w_scale, double b_scale,
-         int eval_level, bool use_bsgs = false, bool suppress_bs_swap = false)
+         int eval_level)
       : context_{context}, in_{in}, eval_level_{eval_level} {
     out_ = TensorLayout{in.width / stride, in.pack * stride, out_channels};
-    auto hoist_map = BuildConvHoistMap(in_, out_, ksize, stride, weights,
-                                       c_in_w, w_scale, use_bsgs);
-    hoist_ = std::make_unique<HoistHandler<word>>(
-        context, hoist_map, eval_level,
-        context->param_.GetScale(eval_level), suppress_bs_swap);
+    auto masks = BuildConvRotationMasks(in_, out_, ksize, stride, weights,
+                                        c_in_w, w_scale);
+    const double pt_scale = context->param_.GetScale(eval_level);
+    for (const auto &[rot, msg] : masks) {
+      int bs = rot % kBabyStride;
+      int gs = rot - bs;
+      Message pre(kNumSlots, Complex(0, 0));
+      for (int i = 0; i < kNumSlots; i++) {
+        pre[(i + gs) % kNumSlots] = msg[i];
+      }
+      Pt pt;
+      context->encoder_.Encode(pt, eval_level, pt_scale, pre);
+      pt_[gs].emplace(bs, std::move(pt));
+      if (bs != 0 && std::find(baby_set_.begin(), baby_set_.end(), bs) ==
+                         baby_set_.end()) {
+        baby_set_.push_back(bs);
+      }
+    }
     auto bias_msg = BuildBiasMessage(out_, bias, b_scale);
     context->encoder_.Encode(bias_, eval_level - 1,
                              context->param_.GetScale(eval_level - 1),
@@ -182,12 +190,47 @@ class ConvBN {
   }
 
   void Evaluate(Ct &res, const Ct &ct, const EvkMap<word> &evk_map) {
-    hoist_->Evaluate(context_, res, ct, evk_map);
+    std::map<int, Ct> xb;  // baby-rotated copies of the input
+    for (int bs : baby_set_) {
+      context_->HRot(xb[bs], ct, evk_map.GetRotationKey(bs), bs);
+    }
+    Ct total, acc, tmp;
+    bool first_group = true;
+    for (const auto &[gs, inner] : pt_) {
+      bool first_term = true;
+      for (const auto &[bs, pt] : inner) {
+        const Ct &src = (bs == 0) ? ct : xb.at(bs);
+        if (first_term) {
+          context_->Mult(acc, src, pt);
+          first_term = false;
+        } else {
+          context_->Mult(tmp, src, pt);
+          context_->Add(acc, acc, tmp);
+        }
+      }
+      if (first_group) {
+        if (gs == 0) {
+          context_->Copy(total, acc);
+        } else {
+          context_->HRot(total, acc, evk_map.GetRotationKey(gs), gs);
+        }
+        first_group = false;
+      } else if (gs == 0) {
+        context_->Add(total, total, acc);
+      } else {
+        // total = HRot(acc, gs) + total (res == b aliasing is a library idiom)
+        context_->HRotAdd(total, acc, total, evk_map.GetRotationKey(gs), gs);
+      }
+    }
+    context_->Rescale(res, total);
     context_->Add(res, res, bias_);
   }
 
   void AddRequiredRotations(EvkRequest &req) {
-    hoist_->AddRequiredRotations(req);
+    for (int bs : baby_set_) req.AddRequest(bs, eval_level_);
+    for (const auto &[gs, inner] : pt_) {
+      if (gs != 0) req.AddRequest(gs, eval_level_);
+    }
   }
 };
 

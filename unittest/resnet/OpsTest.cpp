@@ -414,67 +414,12 @@ TEST_P(Testbed32, DeltaBorderGeometry) {
   EXPECT_EQ(bad, 0);
 }
 
-static void RunDeltaVariant(Testbed32 *tb, bool use_bsgs,
-                            bool suppress_bs_swap) {
-  auto context = tb->context_;
-  auto interface = tb->interface_.get();
-  MultiLevelCiphertext<word>::StaticInit(context->param_, context->encoder_);
-  auto boot_context = std::dynamic_pointer_cast<BootContext<word>>(context);
-  ASSERT_NE(boot_context, nullptr);
-
-  TensorLayout in{32, 1, 4};
-  std::vector<float> w(1 * 4 * 3 * 3, 0.0f), b(1, 0.0f);
-  for (int di = 0; di < 3; di++)
-    for (int dj = 0; dj < 3; dj++)
-      w[(0 * 4 + 0) * 9 + di * 3 + dj] = 1.0f + di * 3 + dj;
-
-  ConvBN<word> conv(boot_context, in, 1, 3, 1, w.data(), 4, b.data(), 1.0,
-                    1.0, kLevel, use_bsgs, suppress_bs_swap);
-  EvkRequest req;
-  conv.AddRequiredRotations(req);
-  interface->PrepareRotationKey(req);
-
-  std::vector<Complex> msg(kNumSlots, Complex(0, 0));
-  int u_in = in.UsedSlots();
-  for (int rep = in.Slot(0, 8, 8); rep < kNumSlots; rep += u_in) {
-    msg[rep] = Complex(1.0, 0);
-  }
-  Ct ct;
-  tb->EncodeAndEncrypt(ct, msg, kLevel);
-  conv.Evaluate(ct, ct, interface->GetEvkMap());
-
-  std::vector<Complex> out;
-  tb->DecryptAndDecode(out, ct);
-  int shown = 0;
-  for (int s = 0; s < kNumSlots && shown < 12; s++) {
-    if (std::abs(out[s].real()) > 1e-3) {
-      int f = s / kFrame, rem = s % kFrame;
-      std::cout << "mass slot " << s << " (f=" << f << ",y=" << rem / kEdge
-                << ",x=" << rem % kEdge << ") got=" << out[s].real()
-                << std::endl;
-      shown++;
-    }
-  }
-  // stamp check: out(8-di, 8-dj) == w[di+1][dj+1]
-  int bad = 0;
-  for (int di = -1; di <= 1; di++) {
-    for (int dj = -1; dj <= 1; dj++) {
-      int s = TensorLayout{32, 1, 1}.Slot(0, 8 - di, 8 - dj);
-      double exp = w[(di + 1) * 3 + (dj + 1)];
-      if (std::abs(out[s].real() - exp) > 1e-3) bad++;
-    }
-  }
-  EXPECT_EQ(bad, 0) << "use_bsgs=" << use_bsgs
-                    << " suppress=" << suppress_bs_swap;
-}
-
-TEST_P(Testbed32, DISABLED_DeltaSingleGroupBaby) {
-  RunDeltaVariant(this, false, true);   // all rots as inner keys (avg_pool style)
-}
-
-TEST_P(Testbed32, DeltaSingleGroupSwap) {
-  RunDeltaVariant(this, false, false);  // auto-swap to all-GS (proven path)
-}
+// History note: the library's hoisted baby-step path (HoistHandler with
+// inner-key groups) dropped every bs != 0 contribution for our conv maps —
+// a delta-input probe kept only the center tap, while the auto-swapped
+// all-giant-step variant produced the exact 3x3 stamp. ConvBN therefore
+// evaluates with manual BSGS over plain HRot/HRotAdd (see ExampleOps.h),
+// which the geometry tests above exercise.
 
 INSTANTIATE_TEST_SUITE_P(
     CheddarOps, Testbed32, testing::Values("resnetparam_40.json"),

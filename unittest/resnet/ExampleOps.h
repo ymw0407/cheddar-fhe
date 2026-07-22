@@ -256,7 +256,8 @@ class EvalReLU {
   int OutputLevel() const { return output_level_; }
 
   void Evaluate(Ct &res, const Ct &ct, const EvkMap<word> &evk_map) {
-    const Evk &mult_key = evk_map.GetMultKey();
+    const Evk &mult_key =
+        evk_map.GetEvk(EvkMap<word>::kMultiplicationKeyIndex);
     Ct s;
     context_->Copy(s, ct);
     for (size_t i = 0; i < stages_.size(); i++) {

@@ -331,19 +331,22 @@ TEST_P(Testbed32, DeltaTapGeometry) {
   std::vector<Complex> out;
   DecryptAndDecode(out, ct);
 
-  // report any slot mismatch > 1e-3 in the first frame
-  int bad = 0;
-  for (int y = 0; y < 32 && bad < 12; y++) {
-    for (int x = 0; x < 32 && bad < 12; x++) {
-      int s = out_lay.Slot(0, y, x);
-      double d = std::abs(out[s].real() - expected[s].real());
-      if (d > 1e-3) {
-        std::cout << "MISMATCH y=" << y << " x=" << x
-                  << " expected=" << expected[s].real()
-                  << " got=" << out[s].real() << std::endl;
-        bad++;
-      }
+  // dump EVERY slot with significant mass (full ring) --> reveals the
+  // library's actual rotation convention: slot -> (frame, y, x)
+  int shown = 0;
+  for (int s = 0; s < kNumSlots && shown < 40; s++) {
+    double got = out[s].real(), exp = expected[s].real();
+    if (std::abs(got) > 1e-3 || std::abs(exp) > 1e-3) {
+      int f = s / kFrame, rem = s % kFrame;
+      std::cout << "slot " << s << " (f=" << f << ",y=" << rem / kEdge
+                << ",x=" << rem % kEdge << ") expected=" << exp
+                << " got=" << got << std::endl;
+      shown++;
     }
+  }
+  int bad = 0;
+  for (int s = 0; s < kNumSlots; s++) {
+    if (std::abs(out[s].real() - expected[s].real()) > 1e-3) bad++;
   }
   EXPECT_EQ(bad, 0);
 }
@@ -390,18 +393,23 @@ TEST_P(Testbed32, DeltaBorderGeometry) {
   }
   std::vector<Complex> out;
   DecryptAndDecode(out, ct);
-  int bad = 0;
-  for (int y = 0; y < 32 && bad < 12; y++) {
-    for (int x = 0; x < 32 && bad < 12; x++) {
-      int s = out_lay.Slot(0, y, x);
-      double d = std::abs(out[s].real() - expected[s].real());
-      if (d > 1e-3) {
-        std::cout << "MISMATCH y=" << y << " x=" << x
-                  << " expected=" << expected[s].real()
-                  << " got=" << out[s].real() << std::endl;
-        bad++;
-      }
+
+  // dump EVERY slot with significant mass (full ring) --> reveals the
+  // library's actual rotation convention: slot -> (frame, y, x)
+  int shown = 0;
+  for (int s = 0; s < kNumSlots && shown < 40; s++) {
+    double got = out[s].real(), exp = expected[s].real();
+    if (std::abs(got) > 1e-3 || std::abs(exp) > 1e-3) {
+      int f = s / kFrame, rem = s % kFrame;
+      std::cout << "slot " << s << " (f=" << f << ",y=" << rem / kEdge
+                << ",x=" << rem % kEdge << ") expected=" << exp
+                << " got=" << got << std::endl;
+      shown++;
     }
+  }
+  int bad = 0;
+  for (int s = 0; s < kNumSlots; s++) {
+    if (std::abs(out[s].real() - expected[s].real()) > 1e-3) bad++;
   }
   EXPECT_EQ(bad, 0);
 }

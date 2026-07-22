@@ -59,17 +59,36 @@ def block(x, prefix, narrowing):
     return relu(t + ident)
 
 
+DEBUG = False
+
+
+def dbg(name, x):
+    # FHE ciphertexts carry x/10 (relu_range normalization); print in that unit
+    if DEBUG:
+        n = x / 10.0
+        print(f"[plain] {name} max|x|/10={np.abs(n).max():.6f} "
+              "first: " + " ".join(f"{v:.6f}" for v in n[0, 0, :6]))
+
+
 def forward(img):
-    x = relu(conv2d(img, load("conv1_reparam.weight"),
-                    load("conv1_reparam.bias"), 1))
+    x = conv2d(img, load("conv1_reparam.weight"),
+               load("conv1_reparam.bias"), 1)
+    dbg("conv0", x)
+    x = relu(x)
+    dbg("relu0", x)
     for i in range(3):
         x = block(x, f"layer1.{i}", False)
+        dbg(f"block1_{i+1}", x)
     x = block(x, "layer2.0", True)
+    dbg("block2_1", x)
     for i in (1, 2):
         x = block(x, f"layer2.{i}", False)
+        dbg(f"block2_{i+1}", x)
     x = block(x, "layer3.0", True)
+    dbg("block3_1", x)
     for i in (1, 2):
         x = block(x, f"layer3.{i}", False)
+        dbg(f"block3_{i+1}", x)
     feat = x.mean(axis=(1, 2))                      # global avg pool -> (64,)
     fc_w = load("linear.weight")
     fc_b = load("linear.bias")
@@ -77,6 +96,10 @@ def forward(img):
 
 
 def main():
+    global DEBUG
+    if "--debug" in sys.argv:
+        DEBUG = True
+        sys.argv.remove("--debug")
     num = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     raw = open(CIFAR_BIN, "rb").read()
     for i in range(num):

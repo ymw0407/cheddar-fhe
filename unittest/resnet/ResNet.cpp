@@ -321,6 +321,19 @@ TEST_P(Testbed32, ResNet20) {
 
   interface_->PrepareRotationKey(rotations);
 
+  auto dbg = [&](const std::string &name, const Ct &ct) {
+    if (!getenv("CHECK")) return;
+    Ct snap;
+    boot_context->Copy(snap, ct);
+    std::vector<Complex> v;
+    DecryptAndDecode(v, snap);
+    double mx = 0;
+    for (size_t j = 0; j < v.size(); j++) mx = std::max(mx, std::abs(v[j].real()));
+    std::cout << "[dbg] " << name << " max|re|=" << mx << " first:";
+    for (int j = 0; j < 6; j++) std::cout << " " << v[j].real();
+    std::cout << std::endl;
+  };
+
   // ---- data ---------------------------------------------------------------
   std::string dataset_dir = "cifar10_data";
   if (!DirectoryExists(dataset_dir)) {
@@ -355,23 +368,34 @@ TEST_P(Testbed32, ResNet20) {
     std::cout << "-- Conv 0 --" << std::endl;
     load_group_keys(0);
     conv0.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("conv0", main_ct);
     relu->Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("relu0", main_ct);
     std::cout << "-- Layer 1 --" << std::endl;
     block1_1.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("block1_1", main_ct);
     block1_2.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("block1_2", main_ct);
     block1_3.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("block1_3", main_ct);
     drop_group_keys(0);
     std::cout << "-- Layer 2 --" << std::endl;
     load_group_keys(1);
     block2_1.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("block2_1", main_ct);
     block2_2.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("block2_2", main_ct);
     block2_3.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("block2_3", main_ct);
     drop_group_keys(1);
     std::cout << "-- Layer 3 --" << std::endl;
     load_group_keys(2);
     block3_1.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("block3_1", main_ct);
     block3_2.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("block3_2", main_ct);
     block3_3.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+    dbg("block3_3", main_ct);
     drop_group_keys(2);
 
     std::cout << "-- AvgPool --" << std::endl;
@@ -385,6 +409,7 @@ TEST_P(Testbed32, ResNet20) {
     boot_context->Trace(main_ct, pool_channel, kHalfDegree / pool_channel,
                         main_ct, interface_->GetEvkMap());
     main_ct.SetNumSlots(fc_input_width);
+    dbg("pool", main_ct);
 
     std::cout << "-- FC --" << std::endl;
     AdjustLevel(boot_context, main_ct, kFcLevel, interface_->GetEvkMap());

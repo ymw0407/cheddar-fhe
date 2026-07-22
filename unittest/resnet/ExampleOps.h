@@ -53,7 +53,8 @@ constexpr int kGsStride = 1024;
 inline PlainHoistMap BuildConvHoistMap(const TensorLayout &in,
                                        const TensorLayout &out, int ksize,
                                        int stride, const float *weights,
-                                       int c_in_w, double w_scale) {
+                                       int c_in_w, double w_scale,
+                                       bool use_bsgs = true) {
   const int pad = ksize / 2;
   const int u_in = in.UsedSlots();
   const int u_out = out.UsedSlots();
@@ -112,7 +113,7 @@ inline PlainHoistMap BuildConvHoistMap(const TensorLayout &in,
       }
     }
     if (all_zero) continue;
-    int bs = rot % kGsStride;
+    int bs = use_bsgs ? rot % kGsStride : rot;
     int gs = rot - bs;
     if (hoist_map.find(gs) == hoist_map.end()) {
       hoist_map.try_emplace(gs, std::map<int, Message>());
@@ -163,14 +164,14 @@ class ConvBN {
   ConvBN(std::shared_ptr<BootContext<word>> context, const TensorLayout &in,
          int out_channels, int ksize, int stride, const float *weights,
          int c_in_w, const float *bias, double w_scale, double b_scale,
-         int eval_level)
+         int eval_level, bool use_bsgs = true, bool suppress_bs_swap = true)
       : context_{context}, in_{in}, eval_level_{eval_level} {
     out_ = TensorLayout{in.width / stride, in.pack * stride, out_channels};
-    auto hoist_map =
-        BuildConvHoistMap(in_, out_, ksize, stride, weights, c_in_w, w_scale);
+    auto hoist_map = BuildConvHoistMap(in_, out_, ksize, stride, weights,
+                                       c_in_w, w_scale, use_bsgs);
     hoist_ = std::make_unique<HoistHandler<word>>(
         context, hoist_map, eval_level,
-        context->param_.GetScale(eval_level), true);
+        context->param_.GetScale(eval_level), suppress_bs_swap);
     auto bias_msg = BuildBiasMessage(out_, bias, b_scale);
     context->encoder_.Encode(bias_, eval_level - 1,
                              context->param_.GetScale(eval_level - 1),

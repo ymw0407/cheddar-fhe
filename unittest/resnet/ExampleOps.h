@@ -146,6 +146,52 @@ inline std::vector<Complex> BuildBiasMessage(const TensorLayout &out,
 // maps of FC/boot are unaffected), while plain HRot/HRotAdd are exact.
 constexpr int kBabyStride = 32;
 
+// Shared manual-BSGS evaluation: res = Rescale(sum_gs Rot_gs(sum_bs
+// pt[gs][bs] * Rot_bs(ct))) + bias. pt masks must be pre-rotated by gs.
+template <typename word>
+inline void EvalBSGSAccum(
+    std::shared_ptr<BootContext<word>> context, Ciphertext<word> &res,
+    const Ciphertext<word> &ct,
+    const std::map<int, std::map<int, Plaintext<word>>> &pt,
+    const std::vector<int> &baby_set, const Plaintext<word> &bias,
+    const EvkMap<word> &evk_map) {
+  using Ct = Ciphertext<word>;
+  std::map<int, Ct> xb;  // baby-rotated copies of the input
+  for (int bs : baby_set) {
+    context->HRot(xb[bs], ct, evk_map.GetRotationKey(bs), bs);
+  }
+  Ct total, acc, tmp;
+  bool first_group = true;
+  for (const auto &[gs, inner] : pt) {
+    bool first_term = true;
+    for (const auto &[bs, mask] : inner) {
+      const Ct &src = (bs == 0) ? ct : xb.at(bs);
+      if (first_term) {
+        context->Mult(acc, src, mask);
+        first_term = false;
+      } else {
+        context->Mult(tmp, src, mask);
+        context->Add(acc, acc, tmp);
+      }
+    }
+    if (first_group) {
+      if (gs == 0) {
+        context->Copy(total, acc);
+      } else {
+        context->HRot(total, acc, evk_map.GetRotationKey(gs), gs);
+      }
+      first_group = false;
+    } else if (gs == 0) {
+      context->Add(total, total, acc);
+    } else {
+      // total = HRot(acc, gs) + total (res == b aliasing is a library idiom)
+      context->HRotAdd(total, acc, total, evk_map.GetRotationKey(gs), gs);
+    }
+  }
+  context->Rescale(res, total);
+  context->Add(res, res, bias);
+}
+
 template <typename word>
 class ConvBN {
  public:
@@ -190,40 +236,7 @@ class ConvBN {
   }
 
   void Evaluate(Ct &res, const Ct &ct, const EvkMap<word> &evk_map) {
-    std::map<int, Ct> xb;  // baby-rotated copies of the input
-    for (int bs : baby_set_) {
-      context_->HRot(xb[bs], ct, evk_map.GetRotationKey(bs), bs);
-    }
-    Ct total, acc, tmp;
-    bool first_group = true;
-    for (const auto &[gs, inner] : pt_) {
-      bool first_term = true;
-      for (const auto &[bs, pt] : inner) {
-        const Ct &src = (bs == 0) ? ct : xb.at(bs);
-        if (first_term) {
-          context_->Mult(acc, src, pt);
-          first_term = false;
-        } else {
-          context_->Mult(tmp, src, pt);
-          context_->Add(acc, acc, tmp);
-        }
-      }
-      if (first_group) {
-        if (gs == 0) {
-          context_->Copy(total, acc);
-        } else {
-          context_->HRot(total, acc, evk_map.GetRotationKey(gs), gs);
-        }
-        first_group = false;
-      } else if (gs == 0) {
-        context_->Add(total, total, acc);
-      } else {
-        // total = HRot(acc, gs) + total (res == b aliasing is a library idiom)
-        context_->HRotAdd(total, acc, total, evk_map.GetRotationKey(gs), gs);
-      }
-    }
-    context_->Rescale(res, total);
-    context_->Add(res, res, bias_);
+    EvalBSGSAccum(context_, res, ct, pt_, baby_set_, bias_, evk_map);
   }
 
   void AddRequiredRotations(EvkRequest &req) {
@@ -256,6 +269,80 @@ class Conv1x1 : public ConvBN<word> {
       : ConvBN<word>{context, in,     out_channels, 1,   1,
                      weights, in.channels, bias,    1.0, 1.0,
                      eval_level} {}
+};
+
+// Final dense layer (fc_out x fc_in) via the same manual BSGS, replacing the
+// library LinearTransform (whose hoisted baby-step path is unreliable for our
+// usage, like the conv case). Input: pooled features replicated with period
+// in_width over the full `ring` slots (the post-Trace state). Output: logits
+// j at every slot j + k*in_width; bias is folded in. Consumes 1 level.
+// Diagonal method: out[i] = sum_d m_d[i] * in[i+d],
+//                  m_d[i] = W[i % in_width][(i + d) % in_width].
+template <typename word>
+class ManualLinear {
+ public:
+  using Ct = Ciphertext<word>;
+  using Pt = Plaintext<word>;
+  static constexpr int kFcBabyStride = 8;
+
+  std::shared_ptr<BootContext<word>> context_;
+  int eval_level_;
+  std::map<int, std::map<int, Pt>> pt_;  // gs -> bs -> pre-rotated diag mask
+  std::vector<int> baby_set_;
+  Pt bias_;
+
+  ManualLinear(std::shared_ptr<BootContext<word>> context, int ring,
+               int in_width, int out_width, const float *weight,
+               const float *bias, int eval_level)
+      : context_{context}, eval_level_{eval_level} {
+    const double pt_scale = context->param_.GetScale(eval_level);
+    for (int d = 0; d < in_width; d++) {
+      Message msg(ring, Complex(0, 0));
+      bool all_zero = true;
+      for (int i = 0; i < ring; i++) {
+        int row = i % in_width;
+        if (row >= out_width) continue;
+        double wv = static_cast<double>(
+            weight[row * in_width + (i + d) % in_width]);
+        if (wv == 0.0) continue;
+        all_zero = false;
+        msg[i] = Complex(wv, 0);
+      }
+      if (all_zero) continue;
+      int bs = d % kFcBabyStride;
+      int gs = d - bs;
+      Message pre(ring, Complex(0, 0));
+      for (int i = 0; i < ring; i++) {
+        pre[(i + gs) % ring] = msg[i];
+      }
+      Pt pt;
+      context->encoder_.Encode(pt, eval_level, pt_scale, pre);
+      pt_[gs].emplace(bs, std::move(pt));
+      if (bs != 0 && std::find(baby_set_.begin(), baby_set_.end(), bs) ==
+                         baby_set_.end()) {
+        baby_set_.push_back(bs);
+      }
+    }
+    Message bias_msg(ring, Complex(0, 0));
+    for (int i = 0; i < ring; i++) {
+      int row = i % in_width;
+      if (row < out_width) bias_msg[i] = Complex(bias[row], 0);
+    }
+    context->encoder_.Encode(bias_, eval_level - 1,
+                             context->param_.GetScale(eval_level - 1),
+                             bias_msg);
+  }
+
+  void Evaluate(Ct &res, const Ct &ct, const EvkMap<word> &evk_map) {
+    EvalBSGSAccum(context_, res, ct, pt_, baby_set_, bias_, evk_map);
+  }
+
+  void AddRequiredRotations(EvkRequest &req) {
+    for (int bs : baby_set_) req.AddRequest(bs, eval_level_);
+    for (const auto &[gs, inner] : pt_) {
+      if (gs != 0) req.AddRequest(gs, eval_level_);
+    }
+  }
 };
 
 // ct-ct multiply idiom of this library (see src/extension/EvalPoly.cpp):

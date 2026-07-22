@@ -298,27 +298,14 @@ TEST_P(Testbed32, ResNet20) {
 
   constexpr int fc_input_width = 64;
   constexpr int fc_output_width = 10;
-  std::vector<std::vector<Complex>> fc_weight(
-      fc_input_width, std::vector<Complex>(fc_input_width, 0.0));
   cnpy::NpyArray fc_weight_npy = cnpy::npy_load(path_list[10][0].weight_path);
   cnpy::NpyArray fc_bias_npy = cnpy::npy_load(path_list[10][0].bias_path);
-  for (int i = 0; i < fc_output_width; i++) {
-    for (int j = 0; j < fc_input_width; j++) {
-      fc_weight[i][j] = fc_weight_npy.data<float>()[i * fc_input_width + j];
-    }
-  }
-  LinearTransform<word> fc(boot_context, ConvertToStripedMatrix(fc_weight),
-                           kFcLevel, boot_context->param_.GetScale(kFcLevel),
-                           8, 8, 0, 0);
+  // Manual-BSGS dense layer (bias folded in); the library LinearTransform is
+  // avoided for the same baby-step reason as the convs (see ExampleOps.h).
+  ManualLinear<word> fc(boot_context, kHalfDegree, fc_input_width,
+                        fc_output_width, fc_weight_npy.data<float>(),
+                        fc_bias_npy.data<float>(), kFcLevel);
   fc.AddRequiredRotations(rotations);
-  Pt fc_bias;
-  std::vector<Complex> plain_fc_bias(fc_input_width, Complex(0, 0));
-  for (int i = 0; i < fc_output_width; i++) {
-    plain_fc_bias[i] = fc_bias_npy.data<float>()[i];
-  }
-  boot_context->encoder_.Encode(fc_bias, kFcLevel - 1,
-                                boot_context->param_.GetScale(kFcLevel - 1),
-                                plain_fc_bias);
 
   interface_->PrepareRotationKey(rotations);
 
@@ -410,14 +397,11 @@ TEST_P(Testbed32, ResNet20) {
     avg_pool.Evaluate(context_, main_ct, main_ct, interface_->GetEvkMap());
     boot_context->Trace(main_ct, pool_channel, kHalfDegree / pool_channel,
                         main_ct, interface_->GetEvkMap());
-    main_ct.SetNumSlots(fc_input_width);
     dbg("pool", main_ct);
 
     std::cout << "-- FC --" << std::endl;
     AdjustLevel(boot_context, main_ct, kFcLevel, interface_->GetEvkMap());
-    fc.Evaluate(context_, main_ct, main_ct, interface_->GetEvkMap());
-    boot_context->Add(main_ct, main_ct, fc_bias);
-    main_ct.SetNumSlots(kHalfDegree);
+    fc.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     __ProfileEnd("ResNet20");
 
     DecryptAndDecode(output_vec, main_ct);

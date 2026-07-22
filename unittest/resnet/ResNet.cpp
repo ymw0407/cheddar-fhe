@@ -328,8 +328,10 @@ TEST_P(Testbed32, ResNet20) {
     mkdir(dataset_dir.c_str(), 0777);
     DownloadCifar10Data();
   }
-  int num_test_images = 1;  // override with IMAGES=n (sequential from img 0)
+  int num_test_images = 1;  // override with IMAGES=n
   if (const char *env = getenv("IMAGES")) num_test_images = atoi(env);
+  int img_start = 0;  // override with IMG_START=n (window [n, n+IMAGES))
+  if (const char *env = getenv("IMG_START")) img_start = atoi(env);
   CIFAR cifar("./" + dataset_dir);
   cifar.read();
   cifar.transform({0, 0, 0}, {255, 255, 255});
@@ -344,9 +346,10 @@ TEST_P(Testbed32, ResNet20) {
   std::vector<Complex> output_vec;
   Ct main_ct;
   for (int i = 0; i < num_test_images; i++) {
+    const int img = img_start + i;
     for (int rep = 0; rep < kNumSlots / (4 * 1024); rep++) {
       for (int j = 0; j < 3 * 1024; j++) {
-        input_vecs[rep * 4 * 1024 + j] = Complex(test_data(j, i), 0.0);
+        input_vecs[rep * 4 * 1024 + j] = Complex(test_data(j, img), 0.0);
       }
     }
     __ProfileStart("ResNet20", warm_up,
@@ -406,17 +409,27 @@ TEST_P(Testbed32, ResNet20) {
     __ProfileEnd("ResNet20");
 
     DecryptAndDecode(output_vec, main_ct);
-    std::cout << "logits[img " << i << "] (true label "
-              << test_labels(i) << "): ";
+    std::cout << "logits[img " << img << "] (true label "
+              << test_labels(img) << "): ";
     for (int j = 0; j < 10; j++) {
       output(j, i) = output_vec[j].real();
       std::cout << output_vec[j].real() << " ";
     }
     std::cout << std::endl;
   }
-  long double acc = compute_accuracy(output, test_labels);
-  std::cout << "Accuracy (" << num_test_images << " images): " << acc
-            << std::endl;
+  Matrix_t window_labels(num_test_images, 1);
+  for (int i = 0; i < num_test_images; i++) {
+    window_labels(i) = test_labels(img_start + i);
+  }
+  long double acc = compute_accuracy(output, window_labels);
+  std::cout << "Accuracy (" << num_test_images << " images, from img "
+            << img_start << "): " << acc << "  misses:";
+  for (int i = 0; i < num_test_images; i++) {
+    Matrix_t::Index arg;
+    output.col(i).maxCoeff(&arg);
+    if (int(arg) != int(window_labels(i))) std::cout << " " << img_start + i;
+  }
+  std::cout << std::endl;
 }
 
 INSTANTIATE_TEST_SUITE_P(

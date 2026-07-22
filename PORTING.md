@@ -71,7 +71,14 @@ narrowing 단계에서 출력 복제본 k(+k·u_out 위치)는 회전 (r − k·
 - [x] sign 도메인 절벽(|x|>1 폭발) → 1단 x/2 폴드 + eps 0.025 재생성 (ec90097):
       절벽 원시 20.5로, 전이대 0.5 유지. BootRangeProbe = 부트는 |v|≤2 오차 0.0034 균일.
 - [x] **50장 FHE 0.96 = 평문 0.94 동률(미스 ⊂ 평문 미스, 근사 기인 추가 미스 0) — P1 종결**
-- [ ] 타이밍 앵커: 키 생성을 측정 구간 밖으로 뺀 뒤 per-image 시간 확정
+- [x] **P2** resnet20 fused teacher + MB 압축 파이프라인 (FHE-research, block9 훈련 중)
+- [x] **P3** export_memresnet.py — MemoryBlock→npy 융합 export (q·k 결합·prenorm BN
+      fold·alpha 흡수), numpy 자체검증 1.8e-8. 단일 전역 S 스케일 규약 확정.
+- [x] **P4(초안)** MemResNet.cpp + MemOps.h(MemOFFBlock) — 압축모델 FHE 회로. 미테스트,
+      GPU0 여유 시 디버그 패스 필요 (레벨/스케일). memOFF만 지원(memON=슬롯예산 초과).
+- [ ] **P4 디버그**: 훈련이 GPU0 비우면 memOFF export → memresnet CHECK=1 → 로짓 vs 평문
+- [ ] 타이밍 앵커: 키 생성을 측정 구간 밖으로 뺀 뒤 baseline vs 압축 per-image 시간
+- [ ] **P5** 동일 라이브러리 baseline(3.4s, N_boot 多) vs 압축(N_boot 少) 시간·정확도
 - [ ] baseline 시간·정확도 (anchor: 공표 1.32s/A100, acc ~91.3%)
 - [ ] MemResNet.cpp + export (FHE-research 쪽 P2·P3 과 합류)
 

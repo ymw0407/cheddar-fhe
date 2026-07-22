@@ -46,8 +46,9 @@ def block(x, prefix, narrowing):
     w2 = load(f"{prefix}.conv2_reparam.weight")
     b2 = load(f"{prefix}.conv2_reparam.bias")
     stride = 2 if narrowing else 1
-    t = relu(conv2d(x, w1, b1, stride))
-    t = conv2d(t, w2, b2, 1)
+    pre1 = conv2d(x, w1, b1, stride)
+    dbg(f"{prefix}.pre1", pre1)  # ReLU input — the sign-approx domain check
+    t = conv2d(relu(pre1), w2, b2, 1)
     if narrowing:
         ws = load(f"{prefix}.shortcut_reparam.weight")
         bs = load(f"{prefix}.shortcut_reparam.bias")
@@ -56,7 +57,9 @@ def block(x, prefix, narrowing):
         ident = conv2d(x, ws, bs, 2)
     else:
         ident = x
-    return relu(t + ident)
+    pre2 = t + ident
+    dbg(f"{prefix}.pre2", pre2)  # second ReLU input
+    return relu(pre2)
 
 
 DEBUG = False

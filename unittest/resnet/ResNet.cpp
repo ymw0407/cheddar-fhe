@@ -287,7 +287,7 @@ TEST_P(Testbed32, ResNet20) {
     }
   }
   HoistHandler<word> avg_pool(boot_context, pool_mask, kPoolLevel,
-                              boot_context->param_.GetScale(kPoolLevel), true);
+                              boot_context->param_.GetScale(kPoolLevel), false);
   avg_pool.AddRequiredRotations(rotations);
   AddRequiredRotationsForTrace(rotations, pool_pack, pool_input_width,
                                kPoolLevel);

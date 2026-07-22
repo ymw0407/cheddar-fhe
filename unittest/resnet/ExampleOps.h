@@ -164,7 +164,7 @@ class ConvBN {
   ConvBN(std::shared_ptr<BootContext<word>> context, const TensorLayout &in,
          int out_channels, int ksize, int stride, const float *weights,
          int c_in_w, const float *bias, double w_scale, double b_scale,
-         int eval_level, bool use_bsgs = true, bool suppress_bs_swap = true)
+         int eval_level, bool use_bsgs = false, bool suppress_bs_swap = false)
       : context_{context}, in_{in}, eval_level_{eval_level} {
     out_ = TensorLayout{in.width / stride, in.pack * stride, out_channels};
     auto hoist_map = BuildConvHoistMap(in_, out_, ksize, stride, weights,

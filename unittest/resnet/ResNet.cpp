@@ -85,7 +85,8 @@ void DownloadCifar10Data() {
   file.close();
   std::string command =
       "chmod +x cifar10_data/download.sh && ./cifar10_data/download.sh";
-  system(command.c_str());
+  int rc = system(command.c_str());
+  (void)rc;
 }
 
 void AddRequiredRotationsForTrace(EvkRequest &rotations, int start_rot_amount,

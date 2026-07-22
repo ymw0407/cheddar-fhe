@@ -101,8 +101,9 @@ inline void set_normal_random(long double* arr, int n, long double mu,
 inline void shuffle_data(Matrix_t& data, Matrix_t& labels) {
   Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic> perm(data.cols());
   perm.setIdentity();
-  std::random_shuffle(perm.indices().data(),
-                      perm.indices().data() + perm.indices().size());
+  std::mt19937 rng(std::random_device{}());
+  std::shuffle(perm.indices().data(),
+               perm.indices().data() + perm.indices().size(), rng);
   data = data * perm;  // permute columns
   labels = labels * perm;
 }

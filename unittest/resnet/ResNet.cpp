@@ -247,10 +247,11 @@ TEST_P(Testbed32, ResNet20) {
   boot_context->AddRequiredRotations(rotations, kNumSlots);
 
   auto load_group_keys = [&](int g) {
-    for (const auto &[rot, level] : group_req[g]) {
-      if (interface_->GetEvkMap().count(rot)) continue;
-      interface_->PrepareRotationKey(rot, level);
-    }
+    // NOTE: never skip on mere key existence — an existing key made for a
+    // lower level has a too-small modulus and silently corrupts rotations.
+    // The library call itself skips (with a warning) only when the existing
+    // key's modulus is sufficient.
+    interface_->PrepareRotationKey(group_req[g]);
   };
   auto drop_group_keys = [&](int g) {
     for (const auto &[rot, level] : group_req[g]) {

@@ -283,6 +283,129 @@ TEST_P(Testbed32, Conv0FullEnvironment) {
   CompareMessages(expected, out, true, 1e-2);
 }
 
+TEST_P(Testbed32, DeltaTapGeometry) {
+  // Delta input at (c=0, y=8, x=8); single-output 3x3 kernel with distinct
+  // tap values --> the decrypted stamp reveals the exact tap mapping.
+  MultiLevelCiphertext<word>::StaticInit(context_->param_, context_->encoder_);
+  auto boot_context = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot_context, nullptr);
+
+  TensorLayout in{32, 1, 4};
+  std::vector<float> w(1 * 4 * 3 * 3, 0.0f), b(1, 0.0f);
+  for (int di = 0; di < 3; di++)
+    for (int dj = 0; dj < 3; dj++)
+      w[(0 * 4 + 0) * 9 + di * 3 + dj] = 1.0f + di * 3 + dj;  // 1..9
+
+  ConvBN<word> conv(boot_context, in, 1, 3, 1, w.data(), 4, b.data(), 1.0,
+                    1.0, kLevel);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<Complex> msg(kNumSlots, Complex(0, 0));
+  int u_in = in.UsedSlots();
+  for (int rep = in.Slot(0, 8, 8); rep < kNumSlots; rep += u_in) {
+    msg[rep] = Complex(1.0, 0);
+  }
+  Ct ct;
+  EncodeAndEncrypt(ct, msg, kLevel);
+  conv.Evaluate(ct, ct, interface_->GetEvkMap());
+
+  // expected stamp: out(y,x) = w[y-8+1][x-8+1] for taps hitting the delta:
+  // out(8+di', 8+dj') gets tap (di=-di'? ...) -- direct formula:
+  // out(y,x) = sum_taps w[di][dj] * delta(y+di-1... ) with our convention
+  // out(y,x) uses input(y+di, x+dj), di,dj in {-1,0,1} => delta at (8,8)
+  // contributes to out(8-di, 8-dj) with weight w[di+1][dj+1].
+  TensorLayout out_lay{32, 1, 1};
+  std::vector<Complex> expected(kNumSlots, Complex(0, 0));
+  int u_out = out_lay.UsedSlots();
+  for (int di = -1; di <= 1; di++) {
+    for (int dj = -1; dj <= 1; dj++) {
+      int y = 8 - di, x = 8 - dj;
+      double wv = w[(di + 1) * 3 + (dj + 1)];
+      for (int rep = out_lay.Slot(0, y, x); rep < kNumSlots; rep += u_out) {
+        expected[rep] = Complex(wv, 0);
+      }
+    }
+  }
+  std::vector<Complex> out;
+  DecryptAndDecode(out, ct);
+
+  // report any slot mismatch > 1e-3 in the first frame
+  int bad = 0;
+  for (int y = 0; y < 32 && bad < 12; y++) {
+    for (int x = 0; x < 32 && bad < 12; x++) {
+      int s = out_lay.Slot(0, y, x);
+      double d = std::abs(out[s].real() - expected[s].real());
+      if (d > 1e-3) {
+        std::cout << "MISMATCH y=" << y << " x=" << x
+                  << " expected=" << expected[s].real()
+                  << " got=" << out[s].real() << std::endl;
+        bad++;
+      }
+    }
+  }
+  EXPECT_EQ(bad, 0);
+}
+
+TEST_P(Testbed32, DeltaBorderGeometry) {
+  // Delta at the (0,0) corner --> border clipping correctness.
+  MultiLevelCiphertext<word>::StaticInit(context_->param_, context_->encoder_);
+  auto boot_context = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot_context, nullptr);
+
+  TensorLayout in{32, 1, 4};
+  std::vector<float> w(1 * 4 * 3 * 3, 0.0f), b(1, 0.0f);
+  for (int di = 0; di < 3; di++)
+    for (int dj = 0; dj < 3; dj++)
+      w[(0 * 4 + 0) * 9 + di * 3 + dj] = 1.0f + di * 3 + dj;
+
+  ConvBN<word> conv(boot_context, in, 1, 3, 1, w.data(), 4, b.data(), 1.0,
+                    1.0, kLevel);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<Complex> msg(kNumSlots, Complex(0, 0));
+  int u_in = in.UsedSlots();
+  for (int rep = in.Slot(0, 0, 0); rep < kNumSlots; rep += u_in) {
+    msg[rep] = Complex(1.0, 0);
+  }
+  Ct ct;
+  EncodeAndEncrypt(ct, msg, kLevel);
+  conv.Evaluate(ct, ct, interface_->GetEvkMap());
+
+  TensorLayout out_lay{32, 1, 1};
+  std::vector<Complex> expected(kNumSlots, Complex(0, 0));
+  int u_out = out_lay.UsedSlots();
+  for (int di = -1; di <= 1; di++) {
+    for (int dj = -1; dj <= 1; dj++) {
+      int y = 0 - di, x = 0 - dj;
+      if (y < 0 || y >= 32 || x < 0 || x >= 32) continue;
+      double wv = w[(di + 1) * 3 + (dj + 1)];
+      for (int rep = out_lay.Slot(0, y, x); rep < kNumSlots; rep += u_out) {
+        expected[rep] = Complex(wv, 0);
+      }
+    }
+  }
+  std::vector<Complex> out;
+  DecryptAndDecode(out, ct);
+  int bad = 0;
+  for (int y = 0; y < 32 && bad < 12; y++) {
+    for (int x = 0; x < 32 && bad < 12; x++) {
+      int s = out_lay.Slot(0, y, x);
+      double d = std::abs(out[s].real() - expected[s].real());
+      if (d > 1e-3) {
+        std::cout << "MISMATCH y=" << y << " x=" << x
+                  << " expected=" << expected[s].real()
+                  << " got=" << out[s].real() << std::endl;
+        bad++;
+      }
+    }
+  }
+  EXPECT_EQ(bad, 0);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     CheddarOps, Testbed32, testing::Values("resnetparam_40.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {

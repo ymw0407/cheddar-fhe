@@ -193,9 +193,9 @@ class DownSample : public ConvBN<word> {
  public:
   DownSample(std::shared_ptr<BootContext<word>> context,
              const TensorLayout &in, int out_channels, const float *weights,
-             const float *bias, int eval_level)
-      : ConvBN<word>{context, in,     out_channels, 1,   2,
-                     weights, in.channels, bias,    1.0, 1.0,
+             const float *bias, double b_scale, int eval_level)
+      : ConvBN<word>{context, in,          out_channels, 1,       2,
+                     weights, in.channels, bias,         1.0,     b_scale,
                      eval_level} {}
 };
 

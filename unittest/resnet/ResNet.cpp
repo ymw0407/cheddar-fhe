@@ -122,7 +122,7 @@ class ResNetBlock {
                in.channels,
                cnpy::npy_load(paths[0].bias_path).data<float>(),
                1.0,
-               1.0,
+               1.0 / kReluRange,
                kConvLevel},
         conv2_{context,
                conv1_.out_,
@@ -133,14 +133,15 @@ class ResNetBlock {
                conv1_.out_.channels,
                cnpy::npy_load(paths[1].bias_path).data<float>(),
                1.0,
-               1.0,
+               1.0 / kReluRange,
                kConvLevel},
         relu_{relu} {
     if (narrowing) {
       downsample_ = std::make_unique<DownSample<word>>(
           context, in, in.channels * 2,
           cnpy::npy_load(paths[2].weight_path).data<float>(),
-          cnpy::npy_load(paths[2].bias_path).data<float>(), kConvLevel);
+          cnpy::npy_load(paths[2].bias_path).data<float>(), 1.0 / kReluRange,
+          kConvLevel);
     }
   }
 
@@ -246,7 +247,10 @@ TEST_P(Testbed32, ResNet20) {
   boot_context->AddRequiredRotations(rotations, kNumSlots);
 
   auto load_group_keys = [&](int g) {
-    interface_->PrepareRotationKey(group_req[g]);
+    for (const auto &[rot, level] : group_req[g]) {
+      if (interface_->GetEvkMap().count(rot)) continue;
+      interface_->PrepareRotationKey(rot, level);
+    }
   };
   auto drop_group_keys = [&](int g) {
     for (const auto &[rot, level] : group_req[g]) {
@@ -390,9 +394,13 @@ TEST_P(Testbed32, ResNet20) {
     __ProfileEnd("ResNet20");
 
     DecryptAndDecode(output_vec, main_ct);
+    std::cout << "logits[img " << i << "] (true label "
+              << test_labels(0, i) << "): ";
     for (int j = 0; j < 10; j++) {
       output(j, i) = output_vec[j].real();
+      std::cout << output_vec[j].real() << " ";
     }
+    std::cout << std::endl;
   }
   long double acc = compute_accuracy(output, test_labels);
   std::cout << "Accuracy (" << num_test_images << " images): " << acc

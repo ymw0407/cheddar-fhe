@@ -45,6 +45,11 @@ struct TensorLayout {
 // weights: float[C_out][C_in_w][K][K] (C_in_w = real weight input channels,
 // may be smaller than layout channels, e.g. conv0 has 3 real of 4 padded).
 // Every weight is multiplied by w_scale (e.g. 1/relu_range folding).
+// BSGS giant-step stride: rotations decompose as (frame shift)*1024 +
+// (small spatial delta), so grouping by multiples of 1024 shares giant-step
+// keys across all convs and keeps baby-step keys to the few spatial deltas.
+constexpr int kGsStride = 1024;
+
 inline PlainHoistMap BuildConvHoistMap(const TensorLayout &in,
                                        const TensorLayout &out, int ksize,
                                        int stride, const float *weights,
@@ -52,9 +57,7 @@ inline PlainHoistMap BuildConvHoistMap(const TensorLayout &in,
   const int pad = ksize / 2;
   const int u_in = in.UsedSlots();
   const int u_out = out.UsedSlots();
-  PlainHoistMap hoist_map;
-  hoist_map.try_emplace(0, std::map<int, Message>());
-  auto &group = hoist_map[0];
+  std::map<int, Message> group;  // total rotation -> mask (BSGS split below)
 
   for (int co = 0; co < out.channels; co++) {
     for (int ci = 0; ci < c_in_w; ci++) {
@@ -94,6 +97,31 @@ inline PlainHoistMap BuildConvHoistMap(const TensorLayout &in,
           }
         }
       }
+    }
+  }
+  // BSGS split: rot = gs + bs with gs a multiple of kGsStride; the inner
+  // mask is pre-rotated by gs (LinearTransform convention:
+  // stored[(i + gs) % num_slots] = mask[i]). All-zero masks are dropped.
+  PlainHoistMap hoist_map;
+  for (const auto &[rot, msg] : group) {
+    bool all_zero = true;
+    for (const auto &v : msg) {
+      if (v != Complex(0, 0)) {
+        all_zero = false;
+        break;
+      }
+    }
+    if (all_zero) continue;
+    int bs = rot % kGsStride;
+    int gs = rot - bs;
+    if (hoist_map.find(gs) == hoist_map.end()) {
+      hoist_map.try_emplace(gs, std::map<int, Message>());
+    }
+    auto &pre_rotated =
+        hoist_map[gs].try_emplace(bs, Message(kNumSlots, Complex(0, 0)))
+            .first->second;
+    for (int i = 0; i < kNumSlots; i++) {
+      pre_rotated[(i + gs) % kNumSlots] = msg[i];
     }
   }
   return hoist_map;

@@ -72,27 +72,30 @@ inline PlainHoistMap BuildConvHoistMap(const TensorLayout &in,
                           (dj + pad)]) *
               w_scale;
           if (wv == 0.0) continue;
-          // rotation amount: constant over (y,x); use any in-bounds point.
+          // base rotation: constant over (y,x); use any in-bounds point.
           int y0 = pad, x0 = pad;  // guaranteed valid for width > ksize
-          int rot = in.Slot(ci, stride * y0 + di, stride * x0 + dj) -
-                    out.Slot(co, y0, x0);
-          rot %= u_in;
-          if (rot < 0) rot += u_in;
-          auto it = group.find(rot);
-          if (it == group.end()) {
-            it = group.try_emplace(rot, Message(kNumSlots, Complex(0, 0)))
-                     .first;
-          }
-          Message &msg = it->second;
-          for (int y = 0; y < out.width; y++) {
-            int yy = stride * y + di;
-            if (yy < 0 || yy >= in.width) continue;
-            for (int x = 0; x < out.width; x++) {
-              int xx = stride * x + dj;
-              if (xx < 0 || xx >= in.width) continue;
-              int s = out.Slot(co, y, x);
-              for (int rep = s; rep < kNumSlots; rep += u_out) {
-                msg[rep] += Complex(wv, 0);
+          int base_rot = in.Slot(ci, stride * y0 + di, stride * x0 + dj) -
+                         out.Slot(co, y0, x0);
+          // Replica-aware rotations: output replica k lives at +k*u_out but
+          // must read the SAME input positions (input is u_in-periodic), so
+          // its rotation is (base_rot - k*u_out) mod u_in. When u_out == u_in
+          // (or a multiple), all replicas share the base rotation.
+          for (int k = 0; k < kNumSlots / u_out; k++) {
+            int rot = (base_rot - k * u_out) % u_in;
+            if (rot < 0) rot += u_in;
+            auto it = group.find(rot);
+            if (it == group.end()) {
+              it = group.try_emplace(rot, Message(kNumSlots, Complex(0, 0)))
+                       .first;
+            }
+            Message &msg = it->second;
+            for (int y = 0; y < out.width; y++) {
+              int yy = stride * y + di;
+              if (yy < 0 || yy >= in.width) continue;
+              for (int x = 0; x < out.width; x++) {
+                int xx = stride * x + dj;
+                if (xx < 0 || xx >= in.width) continue;
+                msg[out.Slot(co, y, x) + k * u_out] += Complex(wv, 0);
               }
             }
           }

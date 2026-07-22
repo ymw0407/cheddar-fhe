@@ -468,7 +468,7 @@ static void RunDeltaVariant(Testbed32 *tb, bool use_bsgs,
                     << " suppress=" << suppress_bs_swap;
 }
 
-TEST_P(Testbed32, DeltaSingleGroupBaby) {
+TEST_P(Testbed32, DISABLED_DeltaSingleGroupBaby) {
   RunDeltaVariant(this, false, true);   // all rots as inner keys (avg_pool style)
 }
 

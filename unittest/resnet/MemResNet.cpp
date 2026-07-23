@@ -1,12 +1,15 @@
-// Compressed ResNet-20 (MemoryBlock, memOFF) on the open-source Cheddar
+// Compressed ResNet-20 (MemoryBlock) on the open-source Cheddar
 // release — P4 of the Cheddar port. Reuses the verified example_ops (ConvBN /
 // EvalPoly / EvalReLU / ManualLinear) via MemOps.h. Geometry + fused weights
 // come from FHE-research/scripts/export_memresnet.py (manifest.json + *.npy);
 // point MEMRESNET_DIR at that export directory.
 //
-// Circuit:  conv1(3->16,3x3) -> ReLU(sign) -> 9x MemOFFBlock -> avgpool -> fc
+// Circuit:  conv1(3->16,3x3) -> ReLU(sign) -> 9x MemBlock -> avgpool -> fc
 // The only sign-ReLU is after conv1; every block uses low-degree polynomials
 // (no bootstrapping inside a block) -> far fewer boots than the baseline.
+// Blocks carry the mentor's memory bank when the export has it (manifest
+// P_degree); the bank runs parallel to the residual path at equal depth, so
+// it adds work but neither levels nor bootstraps.
 //
 // Scale: single global S (manifest scale_S). Ciphertext carries value/S so
 // boot inputs stay bounded; conv weights absorb S so polynomials see true
@@ -54,6 +57,8 @@ struct BlockMeta {
   std::string name;   // e.g. "layer1.0"
   int in_ch, out_ch, stride, rdown_k, b, rP_degree;
   bool shortcut;
+  bool memory = false;   // mentor's bank term present (manifest has P_degree)
+  int n_bank = 0;
 };
 
 static std::string Pref(const std::string &name) {
@@ -95,16 +100,17 @@ TEST_P(Testbed32, MemResNet20) {
     BlockMeta m;
     m.name = b.at("name").get<std::string>();
     ASSERT_EQ(b.at("type").get<std::string>(), "memory")
-        << "MemResNet v1 expects memoryblock export";
-    ASSERT_FALSE(b.contains("P_degree"))
-        << "memON export (has memory bank) not supported by MemResNet v1 — "
-           "use a --no-memory (memOFF) checkpoint";
+        << "MemResNet expects a memoryblock export";
+    m.memory = b.contains("P_degree");   // exporter emits it only when bank on
+    if (m.memory) m.n_bank = b.at("N");
     m.in_ch = b.at("in_ch"); m.out_ch = b.at("out_ch"); m.stride = b.at("stride");
     m.rdown_k = b.at("rdown_k"); m.b = b.at("b"); m.rP_degree = b.at("rP_degree");
     m.shortcut = b.at("shortcut");
     std::cout << "  [meta] " << m.name << " in=" << m.in_ch << " out=" << m.out_ch
               << " s=" << m.stride << " k=" << m.rdown_k << " b=" << m.b
-              << " rPdeg=" << m.rP_degree << " sc=" << m.shortcut << std::endl;
+              << " rPdeg=" << m.rP_degree << " sc=" << m.shortcut
+              << (m.memory ? "  bank N=" + std::to_string(m.n_bank) : "  bank=off")
+              << std::endl;
     ASSERT_GT(m.stride, 0);
     ASSERT_GT(m.b, 0);
     metas.push_back(m);
@@ -142,25 +148,34 @@ TEST_P(Testbed32, MemResNet20) {
   std::cout << "[build] relu OK (out level " << relu->OutputLevel() << ")"
             << std::endl;
 
-  // ---- 9 memOFF blocks (compiled at in_level = end_level) ----------------
-  std::vector<std::unique_ptr<MemOFFBlock<word>>> blocks;
+  // ---- 9 compressed blocks (compiled at in_level = end_level) -----------
+  std::vector<std::unique_ptr<MemBlock<word>>> blocks;
   TensorLayout cur{32, 1, 16};
   for (const auto &m : metas) {
     const std::string p = Pref(m.name);
     const float *sc = m.shortcut ? load(p + "__sc_w") : nullptr;
     auto coef = load_vecd(p + "__rP_coef");
+    std::vector<double> pcoef;
+    const float *qkw = nullptr, *qkb = nullptr, *vw = nullptr;
+    if (m.memory) {
+      qkw = load(p + "__qk_w");
+      qkb = load(p + "__qk_b");
+      vw = load(p + "__v_w");
+      pcoef = load_vecd(p + "__P_coef");
+    }
     std::cout << "[build] " << m.name << " in{" << cur.width << "," << cur.pack
               << "," << cur.channels << "} rP_coef(" << coef.size() << "):";
     for (double c : coef) std::cout << " " << c;
     std::cout << std::flush;
-    blocks.push_back(std::make_unique<MemOFFBlock<word>>(
+    blocks.push_back(std::make_unique<MemBlock<word>>(
         boot_context, cur, m.out_ch, m.stride, m.rdown_k, m.b,
         load(p + "__rdown_w"), load(p + "__rdown_b"),
-        coef, load(p + "__rup_w"), sc, S, end_level));
+        coef, load(p + "__rup_w"), sc, S, end_level,
+        m.n_bank, qkw, qkb, pcoef, vw));
     cur = blocks.back()->OutLayout();
     std::cout << " -> out{" << cur.width << "," << cur.pack << "," << cur.channels
               << "} level " << end_level << "->" << blocks.back()->OutLevel()
-              << std::endl;
+              << (blocks.back()->HasMemory() ? "  [bank on]" : "") << std::endl;
   }
 
   // ---- pool + fc tail (follows the baseline; kReluRange -> S) -------------

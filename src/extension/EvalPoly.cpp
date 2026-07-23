@@ -503,8 +503,15 @@ void EvalPolyNode<word>::Compile(ConstContextPtr<word> context,
     auto [_, split_scale] = basis_eval.GetBaseLevelAndScale(split_degree_);
     double high_scale = working_scale / split_scale;
     if (is_high_constant_) {
-      context->encoder_.EncodeConstant(high_constant_, high_scale,
-                                       working_level,
+      // NOTE(fork): argument order was (scale, level) here while
+      // EncodeConstant's signature is (constant, int level, double scale, ...)
+      // and every other call site passes (working_level, scale). The swap made
+      // the huge CKKS scale land in the int `level` slot, overflowing to
+      // INT_MIN and throwing scale_.at() out of range. Only reachable when a
+      // split's high part is a single constant (e.g. any degree-2 poly), which
+      // is why the odd degree-15 sign polynomials never hit it.
+      context->encoder_.EncodeConstant(high_constant_, working_level,
+                                       high_scale,
                                        coefficients_[split_degree_]);
     } else {
       high_->Compile(context, basis_eval, working_level, high_scale, true);

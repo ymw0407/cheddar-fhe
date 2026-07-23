@@ -21,9 +21,11 @@
 //   shortcut w_scale = 1 (sc_norm = W*h_norm = (W*h_true)/S directly)
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "ExampleOps.h"
+#include "common/Assert.h"
 
 namespace cheddar {
 namespace example_ops {

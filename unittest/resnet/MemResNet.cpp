@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -214,15 +215,29 @@ TEST_P(Testbed32, MemResNet20) {
   interface_->PrepareRotationKey(rotations);
   std::cout << "[build] resident keys OK" << std::endl;
 
-  auto load_group_keys = [&](int g) { interface_->PrepareRotationKey(group_req[g]); };
+  // Rotation-key (re)generation is a per-deployment setup cost, not per-image
+  // inference, but phase-wise residency forces it inside the loop. Time it
+  // separately so the reported inference cost is comparable to the baseline.
+  double keygen_us = 0;
+  auto stopwatch = [&](auto &&fn) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    fn();
+    keygen_us += std::chrono::duration<double, std::micro>(
+                     std::chrono::high_resolution_clock::now() - t0).count();
+  };
+  auto load_group_keys = [&](int g) {
+    stopwatch([&] { interface_->PrepareRotationKey(group_req[g]); });
+  };
   auto drop_group_keys = [&](int g) {
-    for (const auto &[rot, level] : group_req[g]) {
-      if (rotations.find(rot) != rotations.end()) continue;
-      bool later = false;
-      for (int h = g + 1; h < 3 && !later; h++)
-        later = group_req[h].find(rot) != group_req[h].end();
-      if (!later) interface_->EraseRotationKey(rot);
-    }
+    stopwatch([&] {
+      for (const auto &[rot, level] : group_req[g]) {
+        if (rotations.find(rot) != rotations.end()) continue;
+        bool later = false;
+        for (int h = g + 1; h < 3 && !later; h++)
+          later = group_req[h].find(rot) != group_req[h].end();
+        if (!later) interface_->EraseRotationKey(rot);
+      }
+    });
   };
 
   auto dbg = [&](const std::string &name, const Ct &ct) {
@@ -293,6 +308,11 @@ TEST_P(Testbed32, MemResNet20) {
     AdjustLevel(boot_context, main_ct, kFcLevel, interface_->GetEvkMap());
     fc.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     __ProfileEnd("MemResNet20");
+    std::cout << "[time] rotation-key (re)gen inside the timed region: "
+              << static_cast<long>(keygen_us) << "us  <-- setup, subtract for "
+                                                 "inference-only cost"
+              << std::endl;
+    keygen_us = 0;
 
     DecryptAndDecode(output_vec, main_ct);
     std::cout << "logits[img " << img << "] (true label " << test_labels(img)

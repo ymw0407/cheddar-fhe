@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -246,22 +247,34 @@ TEST_P(Testbed32, ResNet20) {
   block3_3.AddRequiredRotations(group_req[2]);
   boot_context->AddRequiredRotations(rotations, kNumSlots);
 
+  // Key (re)generation is deployment setup, not per-image inference; phase-wise
+  // residency forces it inside the loop, so time it separately (mirrors
+  // MemResNet.cpp so the two are comparable).
+  double keygen_us = 0;
+  auto stopwatch = [&](auto &&fn) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    fn();
+    keygen_us += std::chrono::duration<double, std::micro>(
+                     std::chrono::high_resolution_clock::now() - t0).count();
+  };
   auto load_group_keys = [&](int g) {
     // NOTE: never skip on mere key existence — an existing key made for a
     // lower level has a too-small modulus and silently corrupts rotations.
     // The library call itself skips (with a warning) only when the existing
     // key's modulus is sufficient.
-    interface_->PrepareRotationKey(group_req[g]);
+    stopwatch([&] { interface_->PrepareRotationKey(group_req[g]); });
   };
   auto drop_group_keys = [&](int g) {
-    for (const auto &[rot, level] : group_req[g]) {
-      if (rotations.find(rot) != rotations.end()) continue;  // shared: keep
-      bool used_later = false;
-      for (int h = g + 1; h < 3 && !used_later; h++) {
-        used_later = group_req[h].find(rot) != group_req[h].end();
+    stopwatch([&] {
+      for (const auto &[rot, level] : group_req[g]) {
+        if (rotations.find(rot) != rotations.end()) continue;  // shared: keep
+        bool used_later = false;
+        for (int h = g + 1; h < 3 && !used_later; h++) {
+          used_later = group_req[h].find(rot) != group_req[h].end();
+        }
+        if (!used_later) interface_->EraseRotationKey(rot);
       }
-      if (!used_later) interface_->EraseRotationKey(rot);
-    }
+    });
   };
 
   // ---- avg-pool + FC tail (follows the AE public code) --------------------
@@ -407,6 +420,11 @@ TEST_P(Testbed32, ResNet20) {
     AdjustLevel(boot_context, main_ct, kFcLevel, interface_->GetEvkMap());
     fc.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     __ProfileEnd("ResNet20");
+    std::cout << "[time] rotation-key (re)gen inside the timed region: "
+              << static_cast<long>(keygen_us) << "us  <-- setup, subtract for "
+                                                 "inference-only cost"
+              << std::endl;
+    keygen_us = 0;
 
     DecryptAndDecode(output_vec, main_ct);
     std::cout << "logits[img " << img << "] (true label "

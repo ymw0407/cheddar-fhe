@@ -101,6 +101,11 @@ TEST_P(Testbed32, MemResNet20) {
     m.in_ch = b.at("in_ch"); m.out_ch = b.at("out_ch"); m.stride = b.at("stride");
     m.rdown_k = b.at("rdown_k"); m.b = b.at("b"); m.rP_degree = b.at("rP_degree");
     m.shortcut = b.at("shortcut");
+    std::cout << "  [meta] " << m.name << " in=" << m.in_ch << " out=" << m.out_ch
+              << " s=" << m.stride << " k=" << m.rdown_k << " b=" << m.b
+              << " rPdeg=" << m.rP_degree << " sc=" << m.shortcut << std::endl;
+    ASSERT_GT(m.stride, 0);
+    ASSERT_GT(m.b, 0);
     metas.push_back(m);
   }
   ASSERT_EQ(metas.size(), 9u) << "resnet20 has 9 blocks";
@@ -130,8 +135,11 @@ TEST_P(Testbed32, MemResNet20) {
   ConvBN<word> conv1(boot_context, input_layout, 16, 3, 1,
                      load("conv1_w"), 3, load("conv1_b"),
                      1.0 / S, 1.0 / S, kConvLevel);
+  std::cout << "[build] conv1 OK" << std::endl;
   auto relu = std::make_shared<EvalReLU<word>>(boot_context, kConvLevel - 1,
                                                end_level, kSignStages);
+  std::cout << "[build] relu OK (out level " << relu->OutputLevel() << ")"
+            << std::endl;
 
   // ---- 9 memOFF blocks (compiled at in_level = end_level) ----------------
   std::vector<std::unique_ptr<MemOFFBlock<word>>> blocks;
@@ -139,11 +147,19 @@ TEST_P(Testbed32, MemResNet20) {
   for (const auto &m : metas) {
     const std::string p = Pref(m.name);
     const float *sc = m.shortcut ? load(p + "__sc_w") : nullptr;
+    auto coef = load_vecd(p + "__rP_coef");
+    std::cout << "[build] " << m.name << " in{" << cur.width << "," << cur.pack
+              << "," << cur.channels << "} rP_coef(" << coef.size() << "):";
+    for (double c : coef) std::cout << " " << c;
+    std::cout << std::flush;
     blocks.push_back(std::make_unique<MemOFFBlock<word>>(
         boot_context, cur, m.out_ch, m.stride, m.rdown_k, m.b,
         load(p + "__rdown_w"), load(p + "__rdown_b"),
-        load_vecd(p + "__rP_coef"), load(p + "__rup_w"), sc, S, end_level));
+        coef, load(p + "__rup_w"), sc, S, end_level));
     cur = blocks.back()->OutLayout();
+    std::cout << " -> out{" << cur.width << "," << cur.pack << "," << cur.channels
+              << "} level " << end_level << "->" << blocks.back()->OutLevel()
+              << std::endl;
   }
 
   // ---- pool + fc tail (follows the baseline; kReluRange -> S) -------------
@@ -168,6 +184,7 @@ TEST_P(Testbed32, MemResNet20) {
   }
   HoistHandler<word> avg_pool(boot_context, pool_mask, kPoolLevel,
                               boot_context->param_.GetScale(kPoolLevel), false);
+  std::cout << "[build] pool OK" << std::endl;
 
   constexpr int fc_input_width = 64;
   constexpr int fc_output_width = 10;
@@ -176,6 +193,7 @@ TEST_P(Testbed32, MemResNet20) {
   ManualLinear<word> fc(boot_context, kHalfDegree, fc_input_width,
                         fc_output_width, fc_w.data<float>(), fc_b.data<float>(),
                         kFcLevel);
+  std::cout << "[build] fc OK" << std::endl;
 
   // ---- rotation keys: resident (boot/pool/fc) + per-layer block groups ----
   EvkRequest rotations;
@@ -190,7 +208,11 @@ TEST_P(Testbed32, MemResNet20) {
   AddRequiredRotationsForTrace(rotations, pool_channel,
                                kHalfDegree / pool_input_width, kPoolLevel - 1);
   fc.AddRequiredRotations(rotations);
+  std::cout << "[build] rotation requests: resident=" << rotations.size()
+            << " g0=" << group_req[0].size() << " g1=" << group_req[1].size()
+            << " g2=" << group_req[2].size() << std::endl;
   interface_->PrepareRotationKey(rotations);
+  std::cout << "[build] resident keys OK" << std::endl;
 
   auto load_group_keys = [&](int g) { interface_->PrepareRotationKey(group_req[g]); };
   auto drop_group_keys = [&](int g) {

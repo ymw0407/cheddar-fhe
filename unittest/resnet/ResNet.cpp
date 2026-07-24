@@ -49,30 +49,46 @@ static std::string Root(const std::string &rel) {
   return std::string(PROJECT_ROOT) + "/resnet20_fused/" + rel;
 }
 
-// path_list[i] = {conv1, conv2, (shortcut)} of block i (AE ordering).
-static std::vector<std::vector<WeightPath>> path_list = {
-    {{Root("conv1_reparam.weight"), Root("conv1_reparam.bias")}},
-    {{Root("layer1.0.conv1_reparam.weight"), Root("layer1.0.conv1_reparam.bias")},
-     {Root("layer1.0.conv2_reparam.weight"), Root("layer1.0.conv2_reparam.bias")}},
-    {{Root("layer1.1.conv1_reparam.weight"), Root("layer1.1.conv1_reparam.bias")},
-     {Root("layer1.1.conv2_reparam.weight"), Root("layer1.1.conv2_reparam.bias")}},
-    {{Root("layer1.2.conv1_reparam.weight"), Root("layer1.2.conv1_reparam.bias")},
-     {Root("layer1.2.conv2_reparam.weight"), Root("layer1.2.conv2_reparam.bias")}},
-    {{Root("layer2.0.conv1_reparam.weight"), Root("layer2.0.conv1_reparam.bias")},
-     {Root("layer2.0.conv2_reparam.weight"), Root("layer2.0.conv2_reparam.bias")},
-     {Root("layer2.0.shortcut_reparam.weight"), Root("layer2.0.shortcut_reparam.bias")}},
-    {{Root("layer2.1.conv1_reparam.weight"), Root("layer2.1.conv1_reparam.bias")},
-     {Root("layer2.1.conv2_reparam.weight"), Root("layer2.1.conv2_reparam.bias")}},
-    {{Root("layer2.2.conv1_reparam.weight"), Root("layer2.2.conv1_reparam.bias")},
-     {Root("layer2.2.conv2_reparam.weight"), Root("layer2.2.conv2_reparam.bias")}},
-    {{Root("layer3.0.conv1_reparam.weight"), Root("layer3.0.conv1_reparam.bias")},
-     {Root("layer3.0.conv2_reparam.weight"), Root("layer3.0.conv2_reparam.bias")},
-     {Root("layer3.0.shortcut_reparam.weight"), Root("layer3.0.shortcut_reparam.bias")}},
-    {{Root("layer3.1.conv1_reparam.weight"), Root("layer3.1.conv1_reparam.bias")},
-     {Root("layer3.1.conv2_reparam.weight"), Root("layer3.1.conv2_reparam.bias")}},
-    {{Root("layer3.2.conv1_reparam.weight"), Root("layer3.2.conv1_reparam.bias")},
-     {Root("layer3.2.conv2_reparam.weight"), Root("layer3.2.conv2_reparam.bias")}},
-    {{Root("linear.weight"), Root("linear.bias")}}};
+// path_list[i] = {conv1, conv2, (shortcut)} of block i (AE ordering), built
+// at run time by probing the weight files so one driver serves ResNet-20
+// (3 blocks/group) and ResNet-32 (5) — the 6n+2 family shares channels 16/32/64
+// and therefore the packing; only the block count differs.
+static std::vector<std::vector<WeightPath>> path_list;
+static int blocks_per_group[3] = {0, 0, 0};
+
+static bool FileExists(const std::string &path) {
+  struct stat buffer;
+  return stat(path.c_str(), &buffer) == 0;
+}
+
+static void BuildPathList() {
+  path_list.clear();
+  path_list.push_back(
+      {{Root("conv1_reparam.weight"), Root("conv1_reparam.bias")}});
+  const char *groups[3] = {"layer1", "layer2", "layer3"};
+  for (int g = 0; g < 3; g++) {
+    int n = 0;
+    while (FileExists(Root(std::string(groups[g]) + "." + std::to_string(n) +
+                           ".conv1_reparam.weight"))) {
+      n++;
+    }
+    blocks_per_group[g] = n;
+    for (int i = 0; i < n; i++) {
+      std::string stem = std::string(groups[g]) + "." + std::to_string(i);
+      std::vector<WeightPath> entry = {
+          {Root(stem + ".conv1_reparam.weight"),
+           Root(stem + ".conv1_reparam.bias")},
+          {Root(stem + ".conv2_reparam.weight"),
+           Root(stem + ".conv2_reparam.bias")}};
+      if (FileExists(Root(stem + ".shortcut_reparam.weight"))) {
+        entry.push_back({Root(stem + ".shortcut_reparam.weight"),
+                         Root(stem + ".shortcut_reparam.bias")});
+      }
+      path_list.push_back(entry);
+    }
+  }
+  path_list.push_back({{Root("linear.weight"), Root("linear.bias")}});
+}
 
 bool DirectoryExists(const std::string &directory) {
   struct stat buffer;
@@ -214,6 +230,14 @@ TEST_P(Testbed32, ResNet20) {
                                                end_level, kSignStages);
 
   // ---- network construction ----------------------------------------------
+  BuildPathList();
+  ASSERT_GT(blocks_per_group[0], 0)
+      << "no layer1.0 weights under " << Root("") << " (WEIGHTS_DIR wrong?)";
+  const int total_blocks =
+      blocks_per_group[0] + blocks_per_group[1] + blocks_per_group[2];
+  std::cout << "blocks/group = " << blocks_per_group[0] << "/"
+            << blocks_per_group[1] << "/" << blocks_per_group[2]
+            << " -> ResNet-" << (2 * total_blocks + 2) << std::endl;
   TensorLayout input_layout{32, 1, 4};  // 3 real channels + 1 zero pad
   // conv0 folds the 1/relu_range normalization (weights AND bias).
   ConvBN<word> conv0(boot_context, input_layout, 16, 3, 1,
@@ -221,17 +245,23 @@ TEST_P(Testbed32, ResNet20) {
                      3, cnpy::npy_load(path_list[0][0].bias_path).data<float>(),
                      1.0 / kReluRange, 1.0 / kReluRange, kConvLevel);
   TensorLayout l1{32, 1, 16};
-  ResNetBlock block1_1(boot_context, l1, false, relu, path_list[1]);
-  ResNetBlock block1_2(boot_context, l1, false, relu, path_list[2]);
-  ResNetBlock block1_3(boot_context, l1, false, relu, path_list[3]);
-  ResNetBlock block2_1(boot_context, l1, true, relu, path_list[4]);
-  TensorLayout l2 = block2_1.OutLayout();  // {16, 2, 32}
-  ResNetBlock block2_2(boot_context, l2, false, relu, path_list[5]);
-  ResNetBlock block2_3(boot_context, l2, false, relu, path_list[6]);
-  ResNetBlock block3_1(boot_context, l2, true, relu, path_list[7]);
-  TensorLayout l3 = block3_1.OutLayout();  // {8, 4, 64}
-  ResNetBlock block3_2(boot_context, l3, false, relu, path_list[8]);
-  ResNetBlock block3_3(boot_context, l3, false, relu, path_list[9]);
+  // All BasicBlocks shallow→deep; narrowing (stride-2, channel×2) at the first
+  // block of layer2/layer3. Layouts: l1 {32,1,16} → {16,2,32} → {8,4,64}.
+  std::vector<std::unique_ptr<ResNetBlock>> blocks;
+  std::vector<int> block_group;
+  {
+    TensorLayout cur = l1;
+    int pidx = 1;
+    for (int g = 0; g < 3; g++) {
+      for (int i = 0; i < blocks_per_group[g]; i++) {
+        bool narrowing = (g > 0 && i == 0);
+        blocks.push_back(std::make_unique<ResNetBlock>(
+            boot_context, cur, narrowing, relu, path_list[pidx++]));
+        cur = blocks.back()->OutLayout();
+        block_group.push_back(g);
+      }
+    }
+  }
 
   // ---- rotation key requests ---------------------------------------------
   // Phase-wise key residency: conv keys of one layer group are generated
@@ -240,15 +270,9 @@ TEST_P(Testbed32, ResNet20) {
   EvkRequest rotations;
   EvkRequest group_req[3];
   conv0.AddRequiredRotations(group_req[0]);
-  block1_1.AddRequiredRotations(group_req[0]);
-  block1_2.AddRequiredRotations(group_req[0]);
-  block1_3.AddRequiredRotations(group_req[0]);
-  block2_1.AddRequiredRotations(group_req[1]);
-  block2_2.AddRequiredRotations(group_req[1]);
-  block2_3.AddRequiredRotations(group_req[1]);
-  block3_1.AddRequiredRotations(group_req[2]);
-  block3_2.AddRequiredRotations(group_req[2]);
-  block3_3.AddRequiredRotations(group_req[2]);
+  for (size_t b = 0; b < blocks.size(); b++) {
+    blocks[b]->AddRequiredRotations(group_req[block_group[b]]);
+  }
   boot_context->AddRequiredRotations(rotations, kNumSlots);
 
   // Key (re)generation is deployment setup, not per-image inference; phase-wise
@@ -307,8 +331,10 @@ TEST_P(Testbed32, ResNet20) {
                               boot_context->param_.GetScale(kPoolLevel), false);
   avg_pool.AddRequiredRotations(rotations);
   constexpr int fc_feat = 64;
-  cnpy::NpyArray fc_weight_npy = cnpy::npy_load(path_list[10][0].weight_path);
-  cnpy::NpyArray fc_bias_npy = cnpy::npy_load(path_list[10][0].bias_path);
+  cnpy::NpyArray fc_weight_npy =
+      cnpy::npy_load(path_list.back()[0].weight_path);
+  cnpy::NpyArray fc_bias_npy =
+      cnpy::npy_load(path_list.back()[0].bias_path);
   const int ncls = static_cast<int>(fc_weight_npy.shape[0]);
   // 10 classes fit the natural 64 period; 100 classes use a 128 period (the
   // post-pool trace makes the layout 128-periodic with a zero upper half at no
@@ -405,30 +431,20 @@ TEST_P(Testbed32, ResNet20) {
     relu->Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     dbg("relu0", main_ct);
     std::cout << "-- Layer 1 --" << std::endl;
-    block1_1.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
-    dbg("block1_1", main_ct);
-    block1_2.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
-    dbg("block1_2", main_ct);
-    block1_3.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
-    dbg("block1_3", main_ct);
-    drop_group_keys(0);
-    std::cout << "-- Layer 2 --" << std::endl;
-    load_group_keys(1);
-    block2_1.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
-    dbg("block2_1", main_ct);
-    block2_2.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
-    dbg("block2_2", main_ct);
-    block2_3.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
-    dbg("block2_3", main_ct);
-    drop_group_keys(1);
-    std::cout << "-- Layer 3 --" << std::endl;
-    load_group_keys(2);
-    block3_1.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
-    dbg("block3_1", main_ct);
-    block3_2.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
-    dbg("block3_2", main_ct);
-    block3_3.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
-    dbg("block3_3", main_ct);
+    int cur_g = 0, idx_in_group = 0;
+    for (size_t b = 0; b < blocks.size(); b++) {
+      if (block_group[b] != cur_g) {
+        drop_group_keys(cur_g);
+        cur_g = block_group[b];
+        idx_in_group = 0;
+        std::cout << "-- Layer " << (cur_g + 1) << " --" << std::endl;
+        load_group_keys(cur_g);
+      }
+      blocks[b]->Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+      dbg("block" + std::to_string(cur_g + 1) + "_" +
+              std::to_string(++idx_in_group),
+          main_ct);
+    }
     drop_group_keys(2);
 
     std::cout << "-- AvgPool --" << std::endl;

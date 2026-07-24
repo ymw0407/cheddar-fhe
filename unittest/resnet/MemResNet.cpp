@@ -235,14 +235,29 @@ TEST_P(Testbed32, MemResNet20) {
                               boot_context->param_.GetScale(kPoolLevel), false);
   std::cout << "[build] pool OK" << std::endl;
 
-  constexpr int fc_input_width = 64;
-  constexpr int fc_output_width = 10;
+  constexpr int fc_feat = 64;   // pooled feature count (backbone-fixed)
   cnpy::NpyArray fc_w = cnpy::npy_load(dir + "/fc_w.npy");
   cnpy::NpyArray fc_b = cnpy::npy_load(dir + "/fc_b.npy");
-  ManualLinear<word> fc(boot_context, kHalfDegree, fc_input_width,
-                        fc_output_width, fc_w.data<float>(), fc_b.data<float>(),
-                        kFcLevel);
-  std::cout << "[build] fc OK" << std::endl;
+  const int ncls = static_cast<int>(fc_w.shape[0]);
+  // Diagonal-method FC needs out_width <= period. 10 classes fit the natural
+  // 64 period; 100 classes need a 128 period: the post-pool trace below makes
+  // the layout 128-periodic (features in slots 0..63, zeros 64..127) at no
+  // extra level, and the weight matrix is zero-padded to [ncls][128].
+  const int fc_period = (ncls <= fc_feat) ? fc_feat : 2 * fc_feat;
+  std::vector<float> fc_wpad;
+  const float *fc_wp = fc_w.data<float>();
+  if (fc_period != fc_feat) {
+    fc_wpad.assign(static_cast<size_t>(ncls) * fc_period, 0.0f);
+    for (int r = 0; r < ncls; r++)
+      for (int c = 0; c < fc_feat; c++)
+        fc_wpad[static_cast<size_t>(r) * fc_period + c] =
+            fc_wp[static_cast<size_t>(r) * fc_feat + c];
+    fc_wp = fc_wpad.data();
+  }
+  ManualLinear<word> fc(boot_context, kHalfDegree, fc_period, ncls, fc_wp,
+                        fc_b.data<float>(), kFcLevel);
+  std::cout << "[build] fc OK (ncls=" << ncls << " period=" << fc_period << ")"
+            << std::endl;
 
   // ---- rotation keys: resident (boot/pool/fc) + per-layer block groups ----
   EvkRequest rotations;
@@ -266,7 +281,7 @@ TEST_P(Testbed32, MemResNet20) {
   AddRequiredRotationsForTrace(rotations, pool_pack, pool_input_width, kPoolLevel);
   AddRequiredRotationsForTrace(rotations, kXWidth * pool_pack, pool_input_width,
                                kPoolLevel);
-  AddRequiredRotationsForTrace(rotations, pool_channel,
+  AddRequiredRotationsForTrace(rotations, fc_period,
                                kHalfDegree / pool_input_width, kPoolLevel - 1);
   fc.AddRequiredRotations(rotations);
   std::cout << "[build] rotation requests: resident=" << rotations.size()
@@ -312,19 +327,30 @@ TEST_P(Testbed32, MemResNet20) {
   };
 
   // ---- data --------------------------------------------------------------
-  std::string dataset_dir = "cifar10_data";
-  ASSERT_TRUE(DirExists(dataset_dir + "/cifar-10-batches-bin"))
-      << "run the baseline resnet once to fetch " << dataset_dir;
+  const bool is_c100 = (ncls == 100);
+  std::string dataset_dir = is_c100 ? "cifar100_data" : "cifar10_data";
+  if (is_c100) {
+    ASSERT_TRUE(DirExists(dataset_dir + "/cifar-100-binary"))
+        << "cifar100_data/cifar-100-binary/test.bin required — generate with "
+           "FHE-research/scripts/make_cifar100_bin.py";
+  } else {
+    ASSERT_TRUE(DirExists(dataset_dir + "/cifar-10-batches-bin"))
+        << "run the baseline resnet once to fetch " << dataset_dir;
+  }
   int num_test_images = 1;
   if (const char *e = getenv("IMAGES")) num_test_images = atoi(e);
   int img_start = 0;
   if (const char *e = getenv("IMG_START")) img_start = atoi(e);
-  CIFAR cifar("./" + dataset_dir);
+  CIFAR cifar("./" + dataset_dir, is_c100);
   cifar.read();
   cifar.transform({0, 0, 0}, {255, 255, 255});
-  cifar.transform({0.4914, 0.4822, 0.4465}, {0.2023, 0.1994, 0.2010});
+  if (is_c100) {
+    cifar.transform({0.5071, 0.4865, 0.4409}, {0.2673, 0.2564, 0.2762});
+  } else {
+    cifar.transform({0.4914, 0.4822, 0.4465}, {0.2023, 0.1994, 0.2010});
+  }
   Matrix_t test_data = cifar.test_data, test_labels = cifar.test_labels;
-  Matrix_t output; output.resize(10, num_test_images);
+  Matrix_t output; output.resize(ncls, num_test_images);
 
   std::vector<Complex> input_vecs(kNumSlots, Complex(0, 0)), output_vec;
   Ct main_ct;
@@ -382,7 +408,7 @@ TEST_P(Testbed32, MemResNet20) {
     boot_context->Trace(main_ct, kXWidth * pool_pack, pool_input_width, main_ct,
                         interface_->GetEvkMap());
     avg_pool.Evaluate(context_, main_ct, main_ct, interface_->GetEvkMap());
-    boot_context->Trace(main_ct, pool_channel, kHalfDegree / pool_channel,
+    boot_context->Trace(main_ct, fc_period, kHalfDegree / fc_period,
                         main_ct, interface_->GetEvkMap());
     dbg("pool", main_ct);
 
@@ -399,9 +425,12 @@ TEST_P(Testbed32, MemResNet20) {
     DecryptAndDecode(output_vec, main_ct);
     std::cout << "logits[img " << img << "] (true label " << test_labels(img)
               << "): ";
-    for (int j = 0; j < 10; j++) { output(j, i) = output_vec[j].real();
-      std::cout << output_vec[j].real() << " "; }
-    std::cout << std::endl;
+    for (int j = 0; j < ncls; j++) {
+      output(j, i) = output_vec[j].real();
+      if (j < 10) std::cout << output_vec[j].real() << " ";
+    }
+    std::cout << (ncls > 10 ? "... (10/" + std::to_string(ncls) + ")" : "")
+              << std::endl;
   }
   Matrix_t win(num_test_images, 1);
   for (int i = 0; i < num_test_images; i++) win(i) = test_labels(img_start + i);

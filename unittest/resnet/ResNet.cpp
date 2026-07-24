@@ -28,7 +28,8 @@ using namespace cheddar::example_ops;
 using Ct = Ciphertext<word>;
 using Pt = Plaintext<word>;
 
-static constexpr double kReluRange = 10.0;
+static const double kReluRange =
+    getenv("RELU_RANGE") ? atof(getenv("RELU_RANGE")) : 10.0;
 static constexpr int kConvLevel = 2;
 static constexpr int kPoolLevel = 2;
 static constexpr int kFcLevel = 1;
@@ -42,6 +43,9 @@ struct WeightPath {
 };
 
 static std::string Root(const std::string &rel) {
+  // WEIGHTS_DIR: fused-npy 디렉토리 오버라이드 (예: 자체학습 C100 teacher).
+  if (const char *e = getenv("WEIGHTS_DIR"))
+    return std::string(e) + "/" + rel;
   return std::string(PROJECT_ROOT) + "/resnet20_fused/" + rel;
 }
 
@@ -302,23 +306,36 @@ TEST_P(Testbed32, ResNet20) {
   HoistHandler<word> avg_pool(boot_context, pool_mask, kPoolLevel,
                               boot_context->param_.GetScale(kPoolLevel), false);
   avg_pool.AddRequiredRotations(rotations);
+  constexpr int fc_feat = 64;
+  cnpy::NpyArray fc_weight_npy = cnpy::npy_load(path_list[10][0].weight_path);
+  cnpy::NpyArray fc_bias_npy = cnpy::npy_load(path_list[10][0].bias_path);
+  const int ncls = static_cast<int>(fc_weight_npy.shape[0]);
+  // 10 classes fit the natural 64 period; 100 classes use a 128 period (the
+  // post-pool trace makes the layout 128-periodic with a zero upper half at no
+  // extra level) with the weight matrix zero-padded to [ncls][128].
+  const int fc_period = (ncls <= fc_feat) ? fc_feat : 2 * fc_feat;
+  std::vector<float> fc_wpad;
+  const float *fc_wp = fc_weight_npy.data<float>();
+  if (fc_period != fc_feat) {
+    fc_wpad.assign(static_cast<size_t>(ncls) * fc_period, 0.0f);
+    for (int r = 0; r < ncls; r++)
+      for (int c = 0; c < fc_feat; c++)
+        fc_wpad[static_cast<size_t>(r) * fc_period + c] =
+            fc_wp[static_cast<size_t>(r) * fc_feat + c];
+    fc_wp = fc_wpad.data();
+  }
+  // Manual-BSGS dense layer (bias folded in); the library LinearTransform is
+  // avoided for the same baby-step reason as the convs (see ExampleOps.h).
+  ManualLinear<word> fc(boot_context, kHalfDegree, fc_period, ncls, fc_wp,
+                        fc_bias_npy.data<float>(), kFcLevel);
+  fc.AddRequiredRotations(rotations);
+
   AddRequiredRotationsForTrace(rotations, pool_pack, pool_input_width,
                                kPoolLevel);
   AddRequiredRotationsForTrace(rotations, kXWidth * pool_pack,
                                pool_input_width, kPoolLevel);
-  AddRequiredRotationsForTrace(rotations, pool_channel,
+  AddRequiredRotationsForTrace(rotations, fc_period,
                                kHalfDegree / pool_input_width, kPoolLevel - 1);
-
-  constexpr int fc_input_width = 64;
-  constexpr int fc_output_width = 10;
-  cnpy::NpyArray fc_weight_npy = cnpy::npy_load(path_list[10][0].weight_path);
-  cnpy::NpyArray fc_bias_npy = cnpy::npy_load(path_list[10][0].bias_path);
-  // Manual-BSGS dense layer (bias folded in); the library LinearTransform is
-  // avoided for the same baby-step reason as the convs (see ExampleOps.h).
-  ManualLinear<word> fc(boot_context, kHalfDegree, fc_input_width,
-                        fc_output_width, fc_weight_npy.data<float>(),
-                        fc_bias_npy.data<float>(), kFcLevel);
-  fc.AddRequiredRotations(rotations);
 
   interface_->PrepareRotationKey(rotations);
 
@@ -336,8 +353,14 @@ TEST_P(Testbed32, ResNet20) {
   };
 
   // ---- data ---------------------------------------------------------------
-  std::string dataset_dir = "cifar10_data";
-  if (!DirectoryExists(dataset_dir)) {
+  const bool is_c100 = (ncls == 100);
+  std::string dataset_dir = is_c100 ? "cifar100_data" : "cifar10_data";
+  if (is_c100) {
+    if (!DirectoryExists(dataset_dir + "/cifar-100-binary")) {
+      FAIL() << "cifar100_data/cifar-100-binary/test.bin required — generate "
+                "with FHE-research/scripts/make_cifar100_bin.py";
+    }
+  } else if (!DirectoryExists(dataset_dir)) {
     mkdir(dataset_dir.c_str(), 0777);
     DownloadCifar10Data();
   }
@@ -345,14 +368,18 @@ TEST_P(Testbed32, ResNet20) {
   if (const char *env = getenv("IMAGES")) num_test_images = atoi(env);
   int img_start = 0;  // override with IMG_START=n (window [n, n+IMAGES))
   if (const char *env = getenv("IMG_START")) img_start = atoi(env);
-  CIFAR cifar("./" + dataset_dir);
+  CIFAR cifar("./" + dataset_dir, is_c100);
   cifar.read();
   cifar.transform({0, 0, 0}, {255, 255, 255});
-  cifar.transform({0.4914, 0.4822, 0.4465}, {0.2023, 0.1994, 0.2010});
+  if (is_c100) {
+    cifar.transform({0.5071, 0.4865, 0.4409}, {0.2673, 0.2564, 0.2762});
+  } else {
+    cifar.transform({0.4914, 0.4822, 0.4465}, {0.2023, 0.1994, 0.2010});
+  }
   Matrix_t test_data = cifar.test_data;
   Matrix_t test_labels = cifar.test_labels;
   Matrix_t output;
-  output.resize(10, num_test_images);
+  output.resize(ncls, num_test_images);
 
   // input: 4 channel frames (3 real + zero pad), replicated to kNumSlots
   std::vector<Complex> input_vecs(kNumSlots, Complex(0, 0));
@@ -412,7 +439,7 @@ TEST_P(Testbed32, ResNet20) {
     boot_context->Trace(main_ct, kXWidth * pool_pack, pool_input_width,
                         main_ct, interface_->GetEvkMap());
     avg_pool.Evaluate(context_, main_ct, main_ct, interface_->GetEvkMap());
-    boot_context->Trace(main_ct, pool_channel, kHalfDegree / pool_channel,
+    boot_context->Trace(main_ct, fc_period, kHalfDegree / fc_period,
                         main_ct, interface_->GetEvkMap());
     dbg("pool", main_ct);
 
@@ -429,11 +456,12 @@ TEST_P(Testbed32, ResNet20) {
     DecryptAndDecode(output_vec, main_ct);
     std::cout << "logits[img " << img << "] (true label "
               << test_labels(img) << "): ";
-    for (int j = 0; j < 10; j++) {
+    for (int j = 0; j < ncls; j++) {
       output(j, i) = output_vec[j].real();
-      std::cout << output_vec[j].real() << " ";
+      if (j < 10) std::cout << output_vec[j].real() << " ";
     }
-    std::cout << std::endl;
+    std::cout << (ncls > 10 ? "... (10/" + std::to_string(ncls) + ")" : "")
+              << std::endl;
   }
   Matrix_t window_labels(num_test_images, 1);
   for (int i = 0; i < num_test_images; i++) {

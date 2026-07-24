@@ -39,6 +39,11 @@ public:
         labels.resize(number_of_images, 1);
         for (int i = 0; i < number_of_images; i++) {
         unsigned char label = 0;
+        if (cifar100) {
+            // CIFAR-100 binary record: <coarse><fine><3072 pixels> — use fine.
+            unsigned char coarse = 0;
+            file.read((char *)&coarse, sizeof(coarse));
+        }
         file.read((char *)&label, sizeof(label));
         labels(i) = (long double)label;
         for (int ch = 0; ch < n_channels; ch++) {
@@ -77,9 +82,21 @@ void transform(std::vector<double> mean, std::vector<double> stdev) {
             stdev[2];
 }
 
-explicit CIFAR(std::string data_dir) : data_dir(data_dir) {}
+bool cifar100 = false;
+
+explicit CIFAR(std::string data_dir, bool cifar100 = false)
+    : data_dir(data_dir), cifar100(cifar100) {}
 
 void read() {
+    if (cifar100) {
+        // test set only (train unused by inference); see
+        // FHE-research/scripts/make_cifar100_bin.py for the converter.
+        read_cifar_data(data_dir + "/cifar-100-binary/test.bin",
+                        test_data, test_labels);
+        train_data = test_data;
+        train_labels = test_labels;
+        return;
+    }
     std::cout << data_dir + "/cifar-10-batches-bin/data_batch_1.bin" << std::endl;
     read_cifar_data(data_dir + "/cifar-10-batches-bin/data_batch_1.bin",
                     train_data, train_labels);

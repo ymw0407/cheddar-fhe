@@ -55,8 +55,9 @@ static std::string ExportDir() {
 // ---- block geometry parsed from manifest.json --------------------------------
 struct BlockMeta {
   std::string name;   // e.g. "layer1.0"
-  int in_ch, out_ch, stride, rdown_k, b, rP_degree;
-  bool shortcut;
+  std::string type;   // "memory" (MemoryBlock) or "basic" (kept BasicBlock)
+  int in_ch = 0, out_ch = 0, stride = 1, rdown_k = 3, b = 0, rP_degree = 2;
+  bool shortcut = false;
   bool memory = false;   // mentor's bank term present (manifest has P_degree)
   int n_bank = 0;
 };
@@ -99,23 +100,26 @@ TEST_P(Testbed32, MemResNet20) {
   for (const auto &b : J.at("blocks")) {
     BlockMeta m;
     m.name = b.at("name").get<std::string>();
-    ASSERT_EQ(b.at("type").get<std::string>(), "memory")
-        << "MemResNet expects a memoryblock export";
-    m.memory = b.contains("P_degree");   // exporter emits it only when bank on
-    if (m.memory) m.n_bank = b.at("N");
+    m.type = b.at("type").get<std::string>();  // "memory" or "basic" (kept block)
     m.in_ch = b.at("in_ch"); m.out_ch = b.at("out_ch"); m.stride = b.at("stride");
-    m.rdown_k = b.at("rdown_k"); m.b = b.at("b"); m.rP_degree = b.at("rP_degree");
     m.shortcut = b.at("shortcut");
-    std::cout << "  [meta] " << m.name << " in=" << m.in_ch << " out=" << m.out_ch
-              << " s=" << m.stride << " k=" << m.rdown_k << " b=" << m.b
-              << " rPdeg=" << m.rP_degree << " sc=" << m.shortcut
-              << (m.memory ? "  bank N=" + std::to_string(m.n_bank) : "  bank=off")
+    if (m.type == "memory") {
+      m.memory = b.contains("P_degree");  // exporter emits it only when bank on
+      if (m.memory) m.n_bank = b.at("N");
+      m.rdown_k = b.at("rdown_k"); m.b = b.at("b"); m.rP_degree = b.at("rP_degree");
+      ASSERT_GT(m.b, 0);
+    }
+    std::cout << "  [meta] " << m.name << " (" << m.type << ") in=" << m.in_ch
+              << " out=" << m.out_ch << " s=" << m.stride << " sc=" << m.shortcut
+              << (m.type == "basic" ? std::string("  [kept BasicBlock]")
+                  : (m.memory ? "  bank N=" + std::to_string(m.n_bank)
+                              : "  bank=off"))
               << std::endl;
     ASSERT_GT(m.stride, 0);
-    ASSERT_GT(m.b, 0);
     metas.push_back(m);
   }
-  ASSERT_EQ(metas.size(), 9u) << "resnet20 has 9 blocks";
+  ASSERT_GE(metas.size(), 3u);
+  ASSERT_LE(metas.size(), 9u);
 
   // keep all loaded npy alive for the whole setup (ConvBN copies at ctor)
   std::map<std::string, cnpy::NpyArray> npy;
@@ -148,34 +152,63 @@ TEST_P(Testbed32, MemResNet20) {
   std::cout << "[build] relu OK (out level " << relu->OutputLevel() << ")"
             << std::endl;
 
-  // ---- 9 compressed blocks (compiled at in_level = end_level) -----------
-  std::vector<std::unique_ptr<MemBlock<word>>> blocks;
+  // ---- compressed blocks (MemBlock) + kept BasicBlocks (hybrid) ----------
+  // Kept blocks run in the /S-normalized datapath: sign(x/S) == sign(x), so
+  // the shared EvalReLU works unchanged; conv weights map norm->norm
+  // (w_scale 1) and true-scale biases fold 1/S — mirror of the baseline
+  // ResNetBlock with kReluRange replaced by S.
+  struct AnyBlock {
+    std::unique_ptr<MemBlock<word>> mem;
+    std::unique_ptr<ConvBN<word>> c1, c2, sc;  // kept BasicBlock parts
+    TensorLayout out;
+  };
+  std::vector<AnyBlock> blocks;
   TensorLayout cur{32, 1, 16};
   for (const auto &m : metas) {
     const std::string p = Pref(m.name);
-    const float *sc = m.shortcut ? load(p + "__sc_w") : nullptr;
-    auto coef = load_vecd(p + "__rP_coef");
-    std::vector<double> pcoef;
-    const float *qkw = nullptr, *qkb = nullptr, *vw = nullptr;
-    if (m.memory) {
-      qkw = load(p + "__qk_w");
-      qkb = load(p + "__qk_b");
-      vw = load(p + "__v_w");
-      pcoef = load_vecd(p + "__P_coef");
+    AnyBlock ab;
+    if (m.type == "basic") {
+      TensorLayout mid{cur.width / m.stride, cur.pack * m.stride, m.out_ch};
+      ab.c1 = std::make_unique<ConvBN<word>>(
+          boot_context, cur, m.out_ch, 3, m.stride, load(p + "__conv1_w"),
+          cur.channels, load(p + "__conv1_b"), 1.0, 1.0 / S, kConvLevel);
+      ab.c2 = std::make_unique<ConvBN<word>>(
+          boot_context, mid, m.out_ch, 3, 1, load(p + "__conv2_w"),
+          m.out_ch, load(p + "__conv2_b"), 1.0, 1.0 / S, kConvLevel);
+      if (m.shortcut) {
+        ab.sc = std::make_unique<ConvBN<word>>(
+            boot_context, cur, m.out_ch, 1, m.stride, load(p + "__sc_w"),
+            cur.channels, load(p + "__sc_b"), 1.0, 1.0 / S, kConvLevel);
+      }
+      ab.out = mid;
+      std::cout << "[build] " << m.name << " kept BasicBlock in{" << cur.width
+                << "," << cur.pack << "," << cur.channels << "}" << std::endl;
+    } else {
+      const float *sc = m.shortcut ? load(p + "__sc_w") : nullptr;
+      auto coef = load_vecd(p + "__rP_coef");
+      std::vector<double> pcoef;
+      const float *qkw = nullptr, *qkb = nullptr, *vw = nullptr;
+      if (m.memory) {
+        qkw = load(p + "__qk_w");
+        qkb = load(p + "__qk_b");
+        vw = load(p + "__v_w");
+        pcoef = load_vecd(p + "__P_coef");
+      }
+      std::cout << "[build] " << m.name << " in{" << cur.width << "," << cur.pack
+                << "," << cur.channels << "} rP_coef(" << coef.size() << "):";
+      for (double c : coef) std::cout << " " << c;
+      std::cout << std::flush;
+      ab.mem = std::make_unique<MemBlock<word>>(
+          boot_context, cur, m.out_ch, m.stride, m.rdown_k, m.b,
+          load(p + "__rdown_w"), load(p + "__rdown_b"),
+          coef, load(p + "__rup_w"), sc, S, end_level,
+          m.n_bank, qkw, qkb, pcoef, vw);
+      ab.out = ab.mem->OutLayout();
+      std::cout << " -> level " << end_level << "->" << ab.mem->OutLevel()
+                << (ab.mem->HasMemory() ? "  [bank on]" : "") << std::endl;
     }
-    std::cout << "[build] " << m.name << " in{" << cur.width << "," << cur.pack
-              << "," << cur.channels << "} rP_coef(" << coef.size() << "):";
-    for (double c : coef) std::cout << " " << c;
-    std::cout << std::flush;
-    blocks.push_back(std::make_unique<MemBlock<word>>(
-        boot_context, cur, m.out_ch, m.stride, m.rdown_k, m.b,
-        load(p + "__rdown_w"), load(p + "__rdown_b"),
-        coef, load(p + "__rup_w"), sc, S, end_level,
-        m.n_bank, qkw, qkb, pcoef, vw));
-    cur = blocks.back()->OutLayout();
-    std::cout << " -> out{" << cur.width << "," << cur.pack << "," << cur.channels
-              << "} level " << end_level << "->" << blocks.back()->OutLevel()
-              << (blocks.back()->HasMemory() ? "  [bank on]" : "") << std::endl;
+    cur = ab.out;
+    blocks.push_back(std::move(ab));
   }
 
   // ---- pool + fc tail (follows the baseline; kReluRange -> S) -------------
@@ -215,7 +248,19 @@ TEST_P(Testbed32, MemResNet20) {
   EvkRequest rotations;
   EvkRequest group_req[3];
   conv1.AddRequiredRotations(group_req[0]);
-  for (int i = 0; i < 9; i++) blocks[i]->AddRequiredRotations(group_req[i / 3]);
+  auto layer_group = [](const std::string &name) {
+    return name[5] - '1';  // "layerX..." -> 0/1/2
+  };
+  for (size_t i = 0; i < blocks.size(); i++) {
+    int g = layer_group(metas[i].name);
+    if (blocks[i].mem) {
+      blocks[i].mem->AddRequiredRotations(group_req[g]);
+    } else {
+      blocks[i].c1->AddRequiredRotations(group_req[g]);
+      blocks[i].c2->AddRequiredRotations(group_req[g]);
+      if (blocks[i].sc) blocks[i].sc->AddRequiredRotations(group_req[g]);
+    }
+  }
   boot_context->AddRequiredRotations(rotations, kNumSlots);
   avg_pool.AddRequiredRotations(rotations);
   AddRequiredRotationsForTrace(rotations, pool_pack, pool_input_width, kPoolLevel);
@@ -298,11 +343,33 @@ TEST_P(Testbed32, MemResNet20) {
     relu->Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     dbg("relu1", main_ct);
     int cur_group = 0;
-    for (int bi = 0; bi < 9; bi++) {
-      int g = bi / 3;
+    for (size_t bi = 0; bi < blocks.size(); bi++) {
+      int g = layer_group(metas[bi].name);
       if (g != cur_group) { drop_group_keys(cur_group); load_group_keys(g); cur_group = g; }
-      AdjustLevel(boot_context, main_ct, end_level, interface_->GetEvkMap());
-      blocks[bi]->Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+      if (blocks[bi].mem) {
+        AdjustLevel(boot_context, main_ct, end_level, interface_->GetEvkMap());
+        blocks[bi].mem->Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+      } else {
+        // kept BasicBlock — baseline ResNetBlock flow in normalized units
+        Ct identity;
+        boot_context->Copy(identity, main_ct);
+        AdjustLevel(boot_context, main_ct, kConvLevel, interface_->GetEvkMap());
+        Ct tmp;
+        blocks[bi].c1->Evaluate(tmp, main_ct, interface_->GetEvkMap());
+        relu->Evaluate(tmp, tmp, interface_->GetEvkMap());
+        AdjustLevel(boot_context, tmp, kConvLevel, interface_->GetEvkMap());
+        blocks[bi].c2->Evaluate(tmp, tmp, interface_->GetEvkMap());
+        if (blocks[bi].sc) {
+          AdjustLevel(boot_context, identity, kConvLevel, interface_->GetEvkMap());
+          blocks[bi].sc->Evaluate(main_ct, identity, interface_->GetEvkMap());
+          boot_context->Add(main_ct, main_ct, tmp);
+        } else {
+          AdjustLevel(boot_context, identity, kConvLevel - 1,
+                      interface_->GetEvkMap());
+          boot_context->Add(main_ct, tmp, identity);
+        }
+        relu->Evaluate(main_ct, main_ct, interface_->GetEvkMap());
+      }
       dbg(metas[bi].name, main_ct);
     }
     drop_group_keys(cur_group);

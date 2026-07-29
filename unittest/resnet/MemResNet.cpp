@@ -259,6 +259,19 @@ TEST_P(Testbed32, MemResNet20) {
   std::cout << "[build] fc OK (ncls=" << ncls << " period=" << fc_period << ")"
             << std::endl;
 
+  // 데이터 유무는 여기서(키 생성 前에) 확인한다 — 뒤로 미루면 실패를 알기까지
+  // 회전키 생성에 ~3분을 버린다 (2026-07-28 실측).
+  const bool is_c100 = (ncls == 100);
+  const std::string dataset_dir = is_c100 ? "cifar100_data" : "cifar10_data";
+  if (is_c100) {
+    ASSERT_TRUE(DirExists(dataset_dir + "/cifar-100-binary"))
+        << "cifar100_data/cifar-100-binary/test.bin required — generate with "
+           "FHE-research/scripts/make_cifar100_bin.py (실행 디렉토리 기준 상대경로)";
+  } else {
+    ASSERT_TRUE(DirExists(dataset_dir + "/cifar-10-batches-bin"))
+        << "run the baseline resnet once to fetch " << dataset_dir;
+  }
+
   // ---- rotation keys: resident (boot/pool/fc) + per-layer block groups ----
   EvkRequest rotations;
   EvkRequest group_req[3];
@@ -327,16 +340,6 @@ TEST_P(Testbed32, MemResNet20) {
   };
 
   // ---- data --------------------------------------------------------------
-  const bool is_c100 = (ncls == 100);
-  std::string dataset_dir = is_c100 ? "cifar100_data" : "cifar10_data";
-  if (is_c100) {
-    ASSERT_TRUE(DirExists(dataset_dir + "/cifar-100-binary"))
-        << "cifar100_data/cifar-100-binary/test.bin required — generate with "
-           "FHE-research/scripts/make_cifar100_bin.py";
-  } else {
-    ASSERT_TRUE(DirExists(dataset_dir + "/cifar-10-batches-bin"))
-        << "run the baseline resnet once to fetch " << dataset_dir;
-  }
   int num_test_images = 1;
   if (const char *e = getenv("IMAGES")) num_test_images = atoi(e);
   int img_start = 0;

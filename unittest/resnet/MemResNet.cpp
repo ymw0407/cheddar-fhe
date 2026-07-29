@@ -118,8 +118,9 @@ TEST_P(Testbed32, MemResNet20) {
     ASSERT_GT(m.stride, 0);
     metas.push_back(m);
   }
+  // 블록 수는 manifest 가 정한다 — rn20=9 · rn32=15 · layer-wise=3 · hybrid=4~7.
+  // (상한 9 는 rn20 전용 하드코딩이었다: rn32 가 15 로 걸려 즉시 실패했다.)
   ASSERT_GE(metas.size(), 3u);
-  ASSERT_LE(metas.size(), 9u);
 
   // keep all loaded npy alive for the whole setup (ConvBN copies at ctor)
   std::map<std::string, cnpy::NpyArray> npy;
@@ -274,10 +275,13 @@ TEST_P(Testbed32, MemResNet20) {
 
   // ---- rotation keys: resident (boot/pool/fc) + per-layer block groups ----
   EvkRequest rotations;
-  EvkRequest group_req[3];
+  // 그룹 수: rn20/32 는 3 (layer1~3), rn18/34 는 4 (+layer4).
+  static constexpr int kMaxGroups = 4;
+  EvkRequest group_req[kMaxGroups];
   conv1.AddRequiredRotations(group_req[0]);
   auto layer_group = [](const std::string &name) {
-    return name[5] - '1';  // "layerX..." -> 0/1/2
+    const int g = name[5] - '1';  // "layerX..." -> 0-based 그룹
+    return (g >= 0 && g < kMaxGroups) ? g : 0;
   };
   for (size_t i = 0; i < blocks.size(); i++) {
     int g = layer_group(metas[i].name);
@@ -321,7 +325,7 @@ TEST_P(Testbed32, MemResNet20) {
       for (const auto &[rot, level] : group_req[g]) {
         if (rotations.find(rot) != rotations.end()) continue;
         bool later = false;
-        for (int h = g + 1; h < 3 && !later; h++)
+        for (int h = g + 1; h < kMaxGroups && !later; h++)
           later = group_req[h].find(rot) != group_req[h].end();
         if (!later) interface_->EraseRotationKey(rot);
       }

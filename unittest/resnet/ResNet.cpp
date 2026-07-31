@@ -9,7 +9,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -247,19 +249,40 @@ TEST_P(Testbed32, ResNet20) {
   TensorLayout l1{32, 1, 16};
   // All BasicBlocks shallow→deep; narrowing (stride-2, channel×2) at the first
   // block of layer2/layer3. Layouts: l1 {32,1,16} → {16,2,32} → {8,4,64}.
+  // LAZY_WEIGHTS=1: do not pre-encode all blocks' weight plaintexts (they are
+  // device-resident and scale linearly with depth — ResNet-110 OOMs a 40 GB
+  // A100). Instead the evaluation loop below encodes at most LAZY_CHUNK
+  // blocks at a time and frees them after use, batching all images per chunk
+  // so each block is still encoded exactly once per run. Encode+keygen time
+  // is accumulated in keygen_us and reported for subtraction, mirroring the
+  // existing phase-wise key residency.
+  const bool lazy_weights = getenv("LAZY_WEIGHTS") != nullptr;
   std::vector<std::unique_ptr<ResNetBlock>> blocks;
   std::vector<int> block_group;
+  std::vector<TensorLayout> block_in;
+  std::vector<char> block_narrow;
   {
     TensorLayout cur = l1;
-    int pidx = 1;
     for (int g = 0; g < 3; g++) {
       for (int i = 0; i < blocks_per_group[g]; i++) {
         bool narrowing = (g > 0 && i == 0);
-        blocks.push_back(std::make_unique<ResNetBlock>(
-            boot_context, cur, narrowing, relu, path_list[pidx++]));
-        cur = blocks.back()->OutLayout();
+        block_in.push_back(cur);
+        block_narrow.push_back(narrowing);
         block_group.push_back(g);
+        if (narrowing) {
+          cur = TensorLayout{cur.width / 2, cur.pack * 2, cur.channels * 2};
+        }
       }
+    }
+  }
+  if (!lazy_weights) {
+    for (size_t b = 0; b < block_in.size(); b++) {
+      blocks.push_back(std::make_unique<ResNetBlock>(
+          boot_context, block_in[b], block_narrow[b] != 0, relu,
+          path_list[1 + b]));
+      ASSERT_EQ(blocks.back()->OutLayout().channels,
+                block_narrow[b] ? block_in[b].channels * 2
+                                : block_in[b].channels);
     }
   }
 
@@ -410,8 +433,97 @@ TEST_P(Testbed32, ResNet20) {
   // input: 4 channel frames (3 real + zero pad), replicated to kNumSlots
   std::vector<Complex> input_vecs(kNumSlots, Complex(0, 0));
   std::vector<Complex> output_vec;
+
+  if (lazy_weights) {
+    // ---- layer-major batch evaluation, chunk-resident weights -------------
+    int chunk_size = 6;
+    if (const char *env = getenv("LAZY_CHUNK")) chunk_size = atoi(env);
+    std::cout << "[lazy] weights chunk-resident, chunk = " << chunk_size
+              << " blocks, batch = " << num_test_images << " images"
+              << std::endl;
+    std::vector<Ct> cts(num_test_images);
+    __ProfileStart("ResNet20", warm_up, [&] {
+      for (int i = 0; i < num_test_images; i++) {
+        const int img = img_start + i;
+        for (int rep = 0; rep < kNumSlots / (4 * 1024); rep++) {
+          for (int j = 0; j < 3 * 1024; j++) {
+            input_vecs[rep * 4 * 1024 + j] = Complex(test_data(j, img), 0.0);
+          }
+        }
+        EncodeAndEncrypt(cts[i], input_vecs, kConvLevel);
+      }
+    }());
+    std::cout << "-- Conv 0 --" << std::endl;
+    load_group_keys(0);
+    for (int i = 0; i < num_test_images; i++) {
+      conv0.Evaluate(cts[i], cts[i], interface_->GetEvkMap());
+      relu->Evaluate(cts[i], cts[i], interface_->GetEvkMap());
+    }
+    size_t b0 = 0;
+    for (int g = 0; g < 3; g++) {
+      std::cout << "-- Layer " << (g + 1) << " --" << std::endl;
+      size_t gend = b0;
+      while (gend < block_group.size() && block_group[gend] == g) gend++;
+      for (size_t cs = b0; cs < gend; cs += chunk_size) {
+        size_t ce = std::min(cs + static_cast<size_t>(chunk_size), gend);
+        std::vector<std::unique_ptr<ResNetBlock>> chunk;
+        stopwatch([&] {  // encode + incremental keygen = setup, subtracted
+          for (size_t b = cs; b < ce; b++) {
+            chunk.push_back(std::make_unique<ResNetBlock>(
+                boot_context, block_in[b], block_narrow[b] != 0, relu,
+                path_list[1 + b]));
+            chunk.back()->AddRequiredRotations(group_req[g]);
+          }
+          interface_->PrepareRotationKey(group_req[g]);
+        });
+        for (int i = 0; i < num_test_images; i++) {
+          for (auto &blk : chunk) {
+            blk->Evaluate(cts[i], cts[i], interface_->GetEvkMap());
+          }
+        }
+        stopwatch([&] { chunk.clear(); });  // free device plaintexts
+      }
+      drop_group_keys(g);
+      b0 = gend;
+    }
+    std::cout << "-- AvgPool + FC --" << std::endl;
+    for (int i = 0; i < num_test_images; i++) {
+      AdjustLevel(boot_context, cts[i], kPoolLevel, interface_->GetEvkMap());
+      cts[i].SetNumSlots(kHalfDegree);
+      boot_context->Trace(cts[i], pool_pack, pool_input_width, cts[i],
+                          interface_->GetEvkMap());
+      boot_context->Trace(cts[i], kXWidth * pool_pack, pool_input_width,
+                          cts[i], interface_->GetEvkMap());
+      avg_pool.Evaluate(context_, cts[i], cts[i], interface_->GetEvkMap());
+      boot_context->Trace(cts[i], fc_period, kHalfDegree / fc_period, cts[i],
+                          interface_->GetEvkMap());
+      AdjustLevel(boot_context, cts[i], kFcLevel, interface_->GetEvkMap());
+      fc.Evaluate(cts[i], cts[i], interface_->GetEvkMap());
+    }
+    __ProfileEnd("ResNet20");
+    std::cout << "[time] rotation-key (re)gen inside the timed region: "
+              << static_cast<long>(keygen_us)
+              << "us  <-- setup, subtract for inference-only cost"
+              << std::endl;
+    std::cout << "[lazy] wall/setup above cover the whole " << num_test_images
+              << "-image batch — divide (wall - setup) by " << num_test_images
+              << " for per-image time" << std::endl;
+    keygen_us = 0;
+    for (int i = 0; i < num_test_images; i++) {
+      DecryptAndDecode(output_vec, cts[i]);
+      std::cout << "logits[img " << img_start + i << "] (true label "
+                << test_labels(img_start + i) << "): ";
+      for (int j = 0; j < ncls; j++) {
+        output(j, i) = output_vec[j].real();
+        if (j < 10) std::cout << output_vec[j].real() << " ";
+      }
+      std::cout << (ncls > 10 ? "... (10/" + std::to_string(ncls) + ")" : "")
+                << std::endl;
+    }
+  }
+
   Ct main_ct;
-  for (int i = 0; i < num_test_images; i++) {
+  for (int i = 0; lazy_weights ? false : i < num_test_images; i++) {
     const int img = img_start + i;
     for (int rep = 0; rep < kNumSlots / (4 * 1024); rep++) {
       for (int j = 0; j < 3 * 1024; j++) {

@@ -21,6 +21,7 @@
 #include "DatasetUtils.h"
 #include "ExampleOps.h"
 #include "SignCoeffs.h"
+#include "SignCoeffsHP.h"
 #include "cnpy.h"
 
 using word = uint32_t;
@@ -228,8 +229,16 @@ TEST_P(Testbed32, ResNet20) {
   int end_level = boot_context->boot_param_.GetEndLevel();
   std::cout << "boot end level = " << end_level << std::endl;
 
+  // SIGN_HP=1: MPCNN(α≈13)급 4단 고정밀 sign — "같은 환경에서의 MPCNN 정밀도 지점"
+  // 실험용 (기본은 기존 3단 저정밀; memresnet 학생 회로는 이 스위치와 무관).
+  const bool sign_hp = getenv("SIGN_HP") != nullptr;
+  const auto &sign_stages = sign_hp ? kSignStagesHP : kSignStages;
+  std::cout << "[relu] sign stages = "
+            << (sign_hp ? "HP (15,15,27,27 · eps=2^-13)"
+                        : "default (15,15,15 · eps=0.025)")
+            << std::endl;
   auto relu = std::make_shared<EvalReLU<word>>(boot_context, kConvLevel - 1,
-                                               end_level, kSignStages);
+                                               end_level, sign_stages);
 
   // ---- network construction ----------------------------------------------
   BuildPathList();

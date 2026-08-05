@@ -393,19 +393,27 @@ class EvalReLU {
     return depth;
   }
 
-  // stage_coeffs: normal-basis coefficient vectors (low degree first).
+  // stage_coeffs: coefficient vectors (low degree first), power basis by
+  // default. stage_chebyshev[i]=true marks a stage whose vector is in the
+  // CHEBYSHEV basis — only valid when that stage's input lies in [-1,1]
+  // (i.e. never the first stage, whose raw input may exceed |1|). High-degree
+  // sign stages need this: deg-27 in power basis has sum|c|~1e9 and overflows
+  // the CKKS message budget.
   EvalReLU(std::shared_ptr<BootContext<word>> context, int start_level,
            int boot_end_level,
-           const std::vector<std::vector<double>> &stage_coeffs)
+           const std::vector<std::vector<double>> &stage_coeffs,
+           const std::vector<bool> &stage_chebyshev = {})
       : context_{context}, boot_end_level_{boot_end_level} {
     int lvl = start_level;
-    for (const auto &coeffs : stage_coeffs) {
+    for (size_t si = 0; si < stage_coeffs.size(); si++) {
+      const auto &coeffs = stage_coeffs[si];
       int depth = DepthOf(static_cast<int>(coeffs.size()) - 1);
       if (lvl - depth < 1) lvl = boot_end_level;  // boot before this stage
       stage_in_levels_.push_back(lvl);
+      bool cheb = si < stage_chebyshev.size() && stage_chebyshev[si];
       auto poly = std::make_unique<EvalPoly<word>>(
           coeffs, lvl, context->param_.GetScale(lvl),
-          context->param_.GetScale(lvl - depth), false);
+          context->param_.GetScale(lvl - depth), cheb);
       poly->Compile(context);
       lvl -= depth;
       stages_.push_back(std::move(poly));

@@ -233,12 +233,14 @@ TEST_P(Testbed32, ResNet20) {
   // 실험용 (기본은 기존 3단 저정밀; memresnet 학생 회로는 이 스위치와 무관).
   const bool sign_hp = getenv("SIGN_HP") != nullptr;
   const auto &sign_stages = sign_hp ? kSignStagesHP : kSignStages;
+  static const std::vector<bool> kNoCheb{};
+  const auto &sign_cheb = sign_hp ? kSignStagesHPCheb : kNoCheb;
   std::cout << "[relu] sign stages = "
-            << (sign_hp ? "HP (15,15,27,27 · eps=2^-13)"
+            << (sign_hp ? "HP v2 (15,15,27,27 · eps=2^-13 · cheb stages 2+)"
                         : "default (15,15,15 · eps=0.025)")
             << std::endl;
-  auto relu = std::make_shared<EvalReLU<word>>(boot_context, kConvLevel - 1,
-                                               end_level, sign_stages);
+  auto relu = std::make_shared<EvalReLU<word>>(
+      boot_context, kConvLevel - 1, end_level, sign_stages, sign_cheb);
 
   // ---- network construction ----------------------------------------------
   BuildPathList();

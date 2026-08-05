@@ -20,6 +20,8 @@
 //   rup    w_scale = 1/S (renormalizes the datapath back to /S)
 //   shortcut w_scale = 1 (sc_norm = W*h_norm = (W*h_true)/S directly)
 
+#include <cmath>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -48,10 +50,19 @@ class PolyAct {
   PolyAct(std::shared_ptr<BootContext<word>> context,
           const std::vector<double> &coeffs, int in_level)
       : context_{context}, in_level_{in_level} {
-    int depth = DepthOf(static_cast<int>(coeffs.size()) - 1);
+    // EvalPoly strips trailing ~zero coefficients internally — mirror that
+    // here so the planned depth matches what actually gets consumed
+    // (a zero-padded deg-5 vector evaluates as deg-3 and would otherwise
+    // land one level above the plan -> "Number of primes differ" downstream).
+    std::vector<double> trimmed = coeffs;
+    while (trimmed.size() > 1 &&
+           std::abs(trimmed.back()) < kZeroCoeffThreshold) {
+      trimmed.pop_back();
+    }
+    int depth = DepthOf(static_cast<int>(trimmed.size()) - 1);
     out_level_ = in_level - depth;
     poly_ = std::make_unique<EvalPoly<word>>(
-        coeffs, in_level, context->param_.GetScale(in_level),
+        trimmed, in_level, context->param_.GetScale(in_level),
         context->param_.GetScale(out_level_), false);
     poly_->Compile(context);
   }
@@ -64,9 +75,11 @@ class PolyAct {
 // One compressed block. Handles both variants of the mentor's block
 //   C(h) = shortcut(h) + alpha*V*P(K*W_q h)  +  R_psi(h)
 //                        \____ memory bank ____/   \__ residual __/
-// memOFF (bank omitted) passes qk_w == nullptr. Both paths consume the same
-// number of levels (conv 1 + poly depth 2 + conv 1 = 4) and run in parallel,
-// so enabling the bank costs extra work but NOT extra depth or bootstraps.
+// memOFF (bank omitted) passes qk_w == nullptr. When both paths consume the
+// same number of levels (conv 1 + poly depth 2 + conv 1 = 4) the bank costs
+// extra work but NOT extra depth. If the poly depths differ (e.g. rP deg3 vs
+// P deg5, the d5e400 recipe), the deeper path defines the block output level
+// and the shallower one is leveled down before the add.
 //
 // Slot budget: the bank's intermediate holds N channels at the block's output
 // resolution, so it must satisfy N/(pack^2) * 1024 <= kNumSlots. Per layer that
@@ -130,8 +143,17 @@ class MemBlock {
           context, in, n_bank, 1, stride, qk_w, in.channels, qk_b,
           /*w_scale=*/S, /*b_scale=*/1.0, in_level);
       p_ = std::make_unique<PolyAct<word>>(context, P_coef, in_level - 1);
-      AssertTrue(p_->out_level_ == rp_->out_level_,
-                 "memory and residual paths must land on the same level");
+      if (p_->out_level_ != rp_->out_level_) {
+        // Paths of different poly depth (e.g. rP deg3 vs P deg5) are allowed:
+        // the deeper one defines the block output level and the shallower is
+        // leveled down right before the add (see Evaluate).
+        std::cout << "[memblock] path depths differ: rP out " << rp_->out_level_
+                  << " vs P out " << p_->out_level_ << " — aligning at add"
+                  << std::endl;
+        out_level_ =
+            (rp_->out_level_ < p_->out_level_ ? rp_->out_level_
+                                              : p_->out_level_) - 1;
+      }
       // v: N -> Cout (1x1), alpha already folded by the exporter, 1/S renorm.
       std::vector<float> v_bias(out_channels, 0.0f);
       v_ = std::make_unique<ConvBN<word>>(
@@ -167,11 +189,16 @@ class MemBlock {
     rdown_->Evaluate(r, ct, evk_map);   // in_level-1, true scale
     rp_->Evaluate(r, r, evk_map);       // rP out level
     rup_->Evaluate(r, r, evk_map);      // out_level, normalized
-    if (has_memory_) {                  // parallel path, same out level
+    if (has_memory_) {                  // parallel path (depth may differ)
       Ct m;
       qk_->Evaluate(m, ct, evk_map);
       p_->Evaluate(m, m, evk_map);
       v_->Evaluate(m, m, evk_map);
+      int rl = context_->param_.NPToLevel(r.GetNP());
+      int ml = context_->param_.NPToLevel(m.GetNP());
+      int tgt = rl < ml ? rl : ml;
+      if (rl > tgt) context_->LevelDown(r, r, tgt);
+      if (ml > tgt) context_->LevelDown(m, m, tgt);
       context_->Add(r, r, m);
     }
     Ct sc;

@@ -290,6 +290,16 @@ TEST_P(Testbed32, MemResNetBank) {
             << " g2=" << group_req[2].size() << std::endl;
   interface_->PrepareRotationKey(rotations);
   std::cout << "[build] resident keys OK" << std::endl;
+  // KEYS_RESIDENT=1: 그룹 키 전부를 셋업에서 한 번에 생성해, 이미지 루프의
+  // 위상별 재생성(~0.9s/장 실측)을 제거 — 시간 회계 검증용. VRAM 여유가 조건
+  // (초과하면 여기서 OOM — 그 자체가 위상별 상주의 존재 이유 실측).
+  const bool keys_resident = getenv("KEYS_RESIDENT") != nullptr;
+  if (keys_resident) {
+    for (int g = 0; g < kMaxGroups; g++)
+      interface_->PrepareRotationKey(group_req[g]);
+    std::cout << "[build] KEYS_RESIDENT: all group keys generated up front"
+              << std::endl;
+  }
 
   // Rotation-key (re)generation is a per-deployment setup cost, not per-image
   // inference, but phase-wise residency forces it inside the loop. Time it
@@ -302,9 +312,11 @@ TEST_P(Testbed32, MemResNetBank) {
                      std::chrono::high_resolution_clock::now() - t0).count();
   };
   auto load_group_keys = [&](int g) {
+    if (keys_resident) return;
     stopwatch([&] { interface_->PrepareRotationKey(group_req[g]); });
   };
   auto drop_group_keys = [&](int g) {
+    if (keys_resident) return;
     stopwatch([&] {
       for (const auto &[rot, level] : group_req[g]) {
         if (rotations.find(rot) != rotations.end()) continue;
@@ -345,6 +357,12 @@ TEST_P(Testbed32, MemResNetBank) {
 
   std::vector<Complex> input_vecs(kNumSlots, Complex(0, 0)), output_vec;
   Ct main_ct;
+  // 위상별 시간 분해 (RoI 안에서 스탬프, 출력은 ProfileEnd 뒤)
+  using bclk = std::chrono::high_resolution_clock;
+  bclk::time_point tb0, tb1, tb2;
+  auto phase_ms = [](bclk::time_point a, bclk::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
   for (int i = 0; i < num_test_images; i++) {
     const int img = img_start + i;
     for (int rep = 0; rep < kNumSlots / (4 * 1024); rep++)
@@ -352,6 +370,7 @@ TEST_P(Testbed32, MemResNetBank) {
         input_vecs[rep * 4 * 1024 + j] = Complex(test_data(j, img), 0.0);
     __ProfileStart("MemResNetBank", warm_up,
                    EncodeAndEncrypt(main_ct, input_vecs, kConvLevel));
+    tb0 = bclk::now();
     dbg("input", main_ct);
     std::cout << "-- Conv 1 --" << std::endl;
     load_group_keys(0);
@@ -359,6 +378,8 @@ TEST_P(Testbed32, MemResNetBank) {
     dbg("conv1", main_ct);
     relu->Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     dbg("relu1", main_ct);
+    cudaDeviceSynchronize();
+    tb1 = bclk::now();
     int cur_group = 0;
     for (size_t bi = 0; bi < blocks.size(); bi++) {
       int g = layer_group(metas[bi].name);
@@ -390,6 +411,8 @@ TEST_P(Testbed32, MemResNetBank) {
       dbg(metas[bi].name, main_ct);
     }
     drop_group_keys(cur_group);
+    cudaDeviceSynchronize();
+    tb2 = bclk::now();
 
     std::cout << "-- AvgPool --" << std::endl;
     AdjustLevel(boot_context, main_ct, kPoolLevel, interface_->GetEvkMap());
@@ -407,6 +430,11 @@ TEST_P(Testbed32, MemResNetBank) {
     AdjustLevel(boot_context, main_ct, kFcLevel, interface_->GetEvkMap());
     fc.Evaluate(main_ct, main_ct, interface_->GetEvkMap());
     __ProfileEnd("MemResNetBank");
+    const auto tb3 = bclk::now();
+    std::cout << "[time-breakdown] conv1+relu " << phase_ms(tb0, tb1)
+              << "ms  blocks " << phase_ms(tb1, tb2) << "ms  pool+fc+sync "
+              << phase_ms(tb2, tb3) << "ms  (keygen included, next line)"
+              << std::endl;
     std::cout << "[time] rotation-key (re)gen inside the timed region: "
               << static_cast<long>(keygen_us) << "us  <-- setup, subtract for "
                                                  "inference-only cost"

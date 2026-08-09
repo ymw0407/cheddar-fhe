@@ -74,6 +74,15 @@ if (ENABLE_EXTENSION)
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json
                                 cnpy eigen)
 
+  add_executable(memresnet_bank resnet/MemResNetBank.cpp)
+  target_compile_definitions(memresnet_bank
+                             PRIVATE PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
+  target_include_directories(memresnet_bank PRIVATE ${cnpy_SOURCE_DIR}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/resnet)
+  target_link_libraries(memresnet_bank
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json
+                                cnpy eigen)
+
   configure_file(${CMAKE_SOURCE_DIR}/parameters/resnetparam_30.json
                  ${CMAKE_CURRENT_BINARY_DIR}/resnetparam_30.json COPYONLY)
   configure_file(${CMAKE_SOURCE_DIR}/parameters/resnetparam_35.json

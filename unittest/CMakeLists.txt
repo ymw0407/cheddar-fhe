@@ -83,6 +83,15 @@ if (ENABLE_EXTENSION)
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json
                                 cnpy eigen)
 
+  add_executable(memresnet_bootfold resnet/MemResNetBootfold.cpp)
+  target_compile_definitions(memresnet_bootfold
+                             PRIVATE PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
+  target_include_directories(memresnet_bootfold PRIVATE ${cnpy_SOURCE_DIR}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/resnet)
+  target_link_libraries(memresnet_bootfold
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json
+                                cnpy eigen)
+
   configure_file(${CMAKE_SOURCE_DIR}/parameters/resnetparam_30.json
                  ${CMAKE_CURRENT_BINARY_DIR}/resnetparam_30.json COPYONLY)
   configure_file(${CMAKE_SOURCE_DIR}/parameters/resnetparam_35.json

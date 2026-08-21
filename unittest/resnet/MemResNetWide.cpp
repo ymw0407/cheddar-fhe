@@ -285,6 +285,15 @@ TEST_P(Testbed32, MemResNetWide) {
             << " g2=" << group_req[2].size() << std::endl;
   interface_->PrepareRotationKey(rotations);
   std::cout << "[build] resident keys OK" << std::endl;
+  // KEYS_RESIDENT=1: 그룹 키 전부를 셋업에서 한 번에 생성해, 이미지 루프의
+  // 위상별 재생성(~2s/장 실측)을 제거 — bank/bootfold 드라이버와 동일 패턴.
+  const bool keys_resident = getenv("KEYS_RESIDENT") != nullptr;
+  if (keys_resident) {
+    for (int g = 0; g < kMaxGroups; g++)
+      interface_->PrepareRotationKey(group_req[g]);
+    std::cout << "[build] KEYS_RESIDENT: all group keys generated up front"
+              << std::endl;
+  }
 
   double keygen_us = 0;
   auto stopwatch = [&](auto &&fn) {
@@ -294,9 +303,11 @@ TEST_P(Testbed32, MemResNetWide) {
                      std::chrono::high_resolution_clock::now() - t0).count();
   };
   auto load_group_keys = [&](int g) {
+    if (keys_resident) return;
     stopwatch([&] { interface_->PrepareRotationKey(group_req[g]); });
   };
   auto drop_group_keys = [&](int g) {
+    if (keys_resident) return;
     stopwatch([&] {
       for (const auto &[rot, level] : group_req[g]) {
         if (rotations.find(rot) != rotations.end()) continue;
